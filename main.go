@@ -17,8 +17,6 @@ import (
 	"github.com/jessevdk/go-flags"
 )
 
-// TODO: OSX compatibility
-
 type CommandLineOptions struct {
 	FfmpegPath        string `short:"m" long:"ffmpeg" description:"Path to ffmpeg."`
 	FrameDirPath      string `short:"d" long:"frame-dir" description:"Path to directory that will contain the capture frames. Default: ~/Pictures/pmcam"`
@@ -141,7 +139,7 @@ func captureWorker(opts CommandLineOptions) {
 
 		now := time.Now()
 		baseName := "cap_" + now.Format("20060102T150405") + "_" + fmt.Sprintf("%09d", now.Nanosecond())
-		framePath := opts.FrameDirPath + "/" + baseName + ".png"
+		framePath := opts.FrameDirPath + "/" + baseName + ".jpg"
 		err := captureFrame(framePath)
 		if err != nil {
 			fmt.Printf("Error: %s\n", err)
@@ -152,7 +150,7 @@ func captureWorker(opts CommandLineOptions) {
 			diff, err := compareFrames(previousFramePath, framePath, framePath+".diff.png")
 			if err != nil {
 				fmt.Printf("Error: %s\n", err)
-				continue
+				diff = 9999999
 			}
 			os.Remove(framePath + ".diff.png")
 			burstModeMarker := ""
@@ -232,7 +230,7 @@ func cleanUpLocalFiles(opts CommandLineOptions) error {
 func appendCleanUpFindCommandArgs(args []string, dir string, framesTtl int) []string {
 	args = append(args, dir)
 	args = append(args, "-name")
-	args = append(args, "cap_*.png")
+	args = append(args, "cap_*.jpg")
 	args = append(args, "-mtime")
 	args = append(args, "+"+strconv.Itoa(framesTtl))
 	args = append(args, "-delete")
@@ -268,7 +266,7 @@ func cleanUpRemoteFiles(opts CommandLineOptions) error {
 }
 
 func fileTime(filePath string) (time.Time, error) {
-	// /path/to/cap_20151023T113103_058764637.png
+	// /path/to/cap_20151023T113103_058764637.jpg
 	basename := filepath.Base(filePath)
 	s := strings.Split(basename, "_")
 	if len(s) <= 1 {
