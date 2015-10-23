@@ -3,13 +3,15 @@ package main
 import (
 	"errors"
 	"fmt"
-	// "io/ioutil"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jessevdk/go-flags"
@@ -26,6 +28,8 @@ type CommandLineOptions struct {
 	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days. Default: 7"`
 }
 
+var captureWorkerStopChannel = make(chan bool)
+var remoteCopyWorkerStopChannel = make(chan bool)
 var captureWorkerDone = make(chan bool)
 var remoteCopyWorkerDone = make(chan bool)
 var capturedFrames = make(chan string, 4096)
@@ -44,6 +48,9 @@ func captureFrame(filePath string) error {
 	}
 
 	cmd := exec.Command("ffmpeg", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
@@ -64,6 +71,9 @@ func compareFrames(path1 string, path2 string, diffPath string) (int, error) {
 	}
 
 	cmd := exec.Command("compare", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
 		return 0, errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
@@ -88,6 +98,9 @@ func remoteCopy(path string, opts CommandLineOptions) error {
 	args = append(args, opts.RemoteDir)
 
 	cmd := exec.Command("scp", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
@@ -101,6 +114,14 @@ func captureWorker(opts CommandLineOptions) {
 	burstMode := false
 
 	for {
+		select {
+		case _ = <-captureWorkerStopChannel:
+			fmt.Println("Capture worker stopped.")
+			captureWorkerDone <- true
+			return
+		default:
+		}
+
 		now := time.Now()
 		baseName := "cap_" + now.Format("20060102T150405") + "_" + fmt.Sprintf("%09d", now.Nanosecond())
 		framePath := opts.FrameDirPath + "/" + baseName + ".png"
@@ -149,6 +170,14 @@ func captureWorker(opts CommandLineOptions) {
 
 func remoteCopyWorker(opts CommandLineOptions) {
 	for {
+		select {
+		case _ = <-remoteCopyWorkerStopChannel:
+			fmt.Println("Remote copy worker stopped.")
+			remoteCopyWorkerDone <- true
+			return
+		default:
+		}
+
 		capturedFrame := <-capturedFrames
 		err := remoteCopy(capturedFrame, opts)
 		if err != nil {
@@ -159,7 +188,7 @@ func remoteCopyWorker(opts CommandLineOptions) {
 
 func cleanUpLocalFilesWorker(opts CommandLineOptions) {
 	for {
-		cleanUpLocalFiles(opts.FrameDirPath, opts.FramesTtl)
+		cleanUpLocalFiles(opts)
 		time.Sleep(1 * time.Hour)
 	}
 }
@@ -171,9 +200,9 @@ func cleanUpRemoteFilesWorker(opts CommandLineOptions) {
 	}
 }
 
-func cleanUpLocalFiles(frameDirPath string, ttl int) error {
+func cleanUpLocalFiles(opts CommandLineOptions) error {
 	args := []string{}
-	args = appendCleanUpFindCommandArgs(args, frameDirPath, ttl)
+	args = appendCleanUpFindCommandArgs(args, opts.FrameDirPath, opts.FramesTtl)
 	cmd := exec.Command("find", args...)
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
@@ -181,48 +210,19 @@ func cleanUpLocalFiles(frameDirPath string, ttl int) error {
 	}
 
 	return nil
-
-	// var err error
-	// fileInfos, err := ioutil.ReadDir(frameDirPath)
-	// if err != nil {
-	// 	return err
-	// }
-
-	// now := time.Now()
-
-	// for _, fileInfo := range fileInfos {
-	// 	// Make sure we only delete capture files
-	// 	if strings.Index(fileInfo.Name(), "cap_") != 0 {
-	// 		continue
-	// 	}
-
-	// 	t, err := fileTime(fileInfo.Name())
-	// 	if err != nil {
-	// 		fmt.Println(err)
-	// 		continue
-	// 	}
-
-	// 	if t.Add(ttl).Unix() < now.Unix() {
-	// 		os.Remove(frameDirPath + "/" + fileInfo.Name())
-	// 	}
-	// }
-
-	// return nil
 }
 
-func appendCleanUpFindCommandArgs(args []string, dir string, framesTtl int) ([]string) {
+func appendCleanUpFindCommandArgs(args []string, dir string, framesTtl int) []string {
 	args = append(args, dir)
 	args = append(args, "-name")
 	args = append(args, "cap_*.png")
 	args = append(args, "-mtime")
-	args = append(args, "+" + strconv.Itoa(framesTtl))
-	// args = append(args, "-delete")
+	args = append(args, "+"+strconv.Itoa(framesTtl))
+	args = append(args, "-delete")
 	return args
 }
 
 func cleanUpRemoteFiles(opts CommandLineOptions) error {
-	// find . -name 'cap_*' -mtime +7
-	
 	args := []string{}
 
 	s := strings.Split(opts.RemoteDir, ":")
@@ -261,6 +261,8 @@ func fileTime(filePath string) (time.Time, error) {
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	var err error
 
 	var opts CommandLineOptions
@@ -300,8 +302,14 @@ func main() {
 
 	os.MkdirAll(opts.FrameDirPath, 0700)
 
-	cleanUpRemoteFiles(opts)
-	os.Exit(0)
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt)
+	signal.Notify(signalChan, syscall.SIGTERM)
+	go func() {
+		<-signalChan
+		fmt.Println("Receved Ctrl+C: Stopping capture worker...")
+		captureWorkerStopChannel <- true
+	}()
 
 	go captureWorker(opts)
 	go cleanUpLocalFilesWorker(opts)
@@ -313,6 +321,8 @@ func main() {
 
 	<-captureWorkerDone
 	if opts.RemoteDir != "" {
+		fmt.Println("Stopping remote copy worker...")
+		remoteCopyWorkerStopChannel <- true
 		<-remoteCopyWorkerDone
 	}
 }
