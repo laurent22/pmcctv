@@ -35,16 +35,33 @@ var remoteCopyWorkerDone = make(chan bool)
 var capturedFrames = make(chan string, 4096)
 
 func captureFrame(filePath string) error {
-	// ffmpeg -y -loglevel fatal -f video4linux2 -i /dev/video0 -r 1 -t 0.0001 $FILENAME
+	// Linux: ffmpeg -y -loglevel fatal -f video4linux2 -i /dev/video0 -r 1 -t 0.0001 $FILENAME
+	// OSX: $FFMPEG -loglevel fatal -f avfoundation -i "" -r 1 -t 0.0001 $FILENAME
 
-	args := []string{
-		"-y",
-		"-loglevel", "fatal",
-		"-f", "video4linux2",
-		"-i", "/dev/video0",
-		"-r", "1",
-		"-t", "0.0001",
-		filePath,
+	var args []string
+
+	if runtime.GOOS == "linux" { // Linux
+		args = []string{
+			"-y",
+			"-loglevel", "fatal",
+			"-f", "video4linux2",
+			"-i", "/dev/video0",
+			"-r", "1",
+			"-t", "0.0001",
+			filePath,
+		}
+	} else if runtime.GOOS == "darwin" { // OSX
+		args = []string{
+			"-y",
+			"-loglevel", "fatal",
+			"-f", "avfoundation",
+			"-i", "",
+			"-r", "1",
+			"-t", "0.0001",
+			filePath,
+		}
+	} else {
+		panic("Unsupported OS: " + runtime.GOOS)
 	}
 
 	cmd := exec.Command("ffmpeg", args...)
