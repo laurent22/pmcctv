@@ -43,20 +43,20 @@ From Cygwin, run `go get -u github.com/laurent22/pmcctv && go install github.com
 
 ## Usage
 
-  Usage:
-    pmcctv [OPTIONS]
+    Usage:
+      pmcctv [OPTIONS]
 
-  Application Options:
-    -m, --ffmpeg=              Path to ffmpeg.
-    -d, --frame-dir=           Path to directory that will contain the capture frames. Default: ~/Pictures/pmcctv
-    -r, --remote-dir=          Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcctv).
-    -p, --remote-port=         Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22).
-    -b, --burst-mode-duration= Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether. Default: 10
-    -t, --time-to-live=        For how long captured frames should be kept, in days. Default: 7
+    Application Options:
+      -m, --ffmpeg=              Path to ffmpeg.
+      -d, --frame-dir=           Path to directory that will contain the capture frames. Default: ~/Pictures/pmcctv
+      -r, --remote-dir=          Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcctv).
+      -p, --remote-port=         Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22).
+      -b, --burst-mode-duration= Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether. Default: 10
+      -t, --time-to-live=        For how long captured frames should be kept, in days. Default: 7
 
-  Help Options:
-    -h, --help                 Show this help message
-
+    Help Options:
+      -h, --help                 Show this help message
+      
 To stop the script, press Ctrl + C.
 
 ## TODO
