@@ -24,6 +24,7 @@ type CommandLineOptions struct {
 	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days. Default: 7"`
 }
 
+var useRsync = false
 var captureWorkerDone = make(chan bool)
 var capturedFrames = make(chan string, 4096)
 
@@ -106,6 +107,61 @@ func remoteCopy(path string, opts CommandLineOptions) error {
 	if err != nil {
 		return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
 	}
+
+	return nil
+}
+
+func multipleRemoteCopy(paths []string, opts CommandLineOptions) error {
+	args := []string{}
+
+	// It only makes sense to use rsync if there's more than one file to transfer
+	if useRsync && len(paths) > 1 {
+		// rsync -a <paths> <remote_dir>
+
+		args = append(args, "-a")
+
+		for _, path := range paths {
+			args = append(args, path)
+		}
+
+		if opts.RemotePort != "" {
+			args = append(args, "-e")
+			args = append(args, "ssh -p " + opts.RemotePort)
+		}
+
+		args = append(args, opts.RemoteDir)
+
+		fmt.Println("Running ", args)
+
+		cmd := exec.Command("rsync", args...)
+		buff, err := cmd.CombinedOutput()
+		if err != nil {
+			return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
+		}
+	} else {
+		// 	scp <path> <remote_dir>
+
+		for _, path := range paths {
+			args = append(args, path)
+		}
+
+		if opts.RemotePort != "" {
+			args = append(args, "-P")
+			args = append(args, opts.RemotePort)
+		}
+
+		args = append(args, opts.RemoteDir)
+
+		fmt.Println("Running ", args)
+
+		cmd := exec.Command("scp", args...)
+		buff, err := cmd.CombinedOutput()
+		if err != nil {
+			return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
+		}
+
+	}
+	
 	return nil
 }
 
@@ -163,10 +219,20 @@ func captureWorker(opts CommandLineOptions) {
 
 func remoteCopyWorker(opts CommandLineOptions) {
 	for {
-		capturedFrame := <-capturedFrames
-		err := remoteCopy(capturedFrame, opts)
+		var paths []string
+		itemCount := len(capturedFrames)
+		if itemCount <= 0 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		for i := 0; i < itemCount; i++ {
+			f := <-capturedFrames
+			paths = append(paths, f)
+		}
+
+		err := multipleRemoteCopy(paths, opts)
 		if err != nil {
-			fmt.Printf("Error: could not remote copy \"%s\": %s", capturedFrame, err)
+			fmt.Printf("Error: could not remote copy \"%s\": %s", paths, err)
 		}
 	}
 }
@@ -245,6 +311,19 @@ func fileTime(filePath string) (time.Time, error) {
 	return time.Parse("20060102T150405", s[1])
 }
 
+func commandIsAvailable(commandName string) bool {
+	err := exec.Command("type", commandName).Run()
+	if err == nil {
+		return true
+	} else {
+		err = exec.Command("sh", "-c", "type "+commandName).Run()
+		if err == nil {
+			return true
+		}
+	}
+	return false
+} 
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
@@ -291,6 +370,7 @@ func main() {
 	go cleanUpLocalFilesWorker(opts)
 
 	if opts.RemoteDir != "" {
+		useRsync = commandIsAvailable("rsync")
 		go remoteCopyWorker(opts)
 		go cleanUpRemoteFilesWorker(opts)
 	}
