@@ -1,6 +1,6 @@
 # pmcctv - poor man's CCTV system in Go
 
-This Go application captures images from a webcam with motion detection support.
+This Go application captures images from a webcam with support for motion detection support, burst mode, and upload to a remote directory.
 
 A Go worker captures frames at regular intervals using `ffmpeg`. Then ImageMagick's `compare` tool is used to check if this frame is similar to the previous one. If the frames are different enough, they are kept, otherwise they are deleted. This provide very simple motion detection and avoids filling up the hard drive with duplicate frames.
 
