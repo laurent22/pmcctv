@@ -131,8 +131,6 @@ func multipleRemoteCopy(paths []string, opts CommandLineOptions) error {
 
 		args = append(args, opts.RemoteDir)
 
-		fmt.Println("Running ", args)
-
 		cmd := exec.Command("rsync", args...)
 		buff, err := cmd.CombinedOutput()
 		if err != nil {
@@ -151,8 +149,6 @@ func multipleRemoteCopy(paths []string, opts CommandLineOptions) error {
 		}
 
 		args = append(args, opts.RemoteDir)
-
-		fmt.Println("Running ", args)
 
 		cmd := exec.Command("scp", args...)
 		buff, err := cmd.CombinedOutput()
