@@ -17,9 +17,9 @@ import (
 
 type CommandLineOptions struct {
 	FfmpegPath        string `short:"m" long:"ffmpeg" description:"Path to ffmpeg."`
-	FrameDirPath      string `short:"d" long:"frame-dir" description:"Path to directory that will contain the capture frames. Default: ~/Pictures/pmcam"`
-	RemoteDir         string `short:"r" long:"remote-dir" description:"Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcam)."`
-	RemotePort        string `short:"p" long:"remote-port" description:"Remote location port where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
+	FrameDirPath      string `short:"d" long:"frame-dir" description:"Path to directory that will contain the capture frames. Default: ~/Pictures/pmcctv"`
+	RemoteDir         string `short:"r" long:"remote-dir" description:"Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcctv)."`
+	RemotePort        string `short:"p" long:"remote-port" description:"Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
 	BurstModeDuration int    `short:"b" long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether. Default: 10"`
 	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days. Default: 7"`
 }
@@ -359,7 +359,7 @@ func main() {
 			fmt.Println("No frame dir specified and cannot detect default Pictures dir. Please specify it with the --frame-dir option")
 			os.Exit(1)
 		}
-		opts.FrameDirPath = u.HomeDir + "/Pictures/pmcam"
+		opts.FrameDirPath = u.HomeDir + "/Pictures/pmcctv"
 	}
 
 	opts.FrameDirPath = strings.TrimRight(opts.FrameDirPath, "/")
