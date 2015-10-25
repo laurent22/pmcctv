@@ -5,13 +5,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/jessevdk/go-flags"
@@ -26,10 +24,7 @@ type CommandLineOptions struct {
 	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days. Default: 7"`
 }
 
-var captureWorkerStopChannel = make(chan bool)
-var remoteCopyWorkerStopChannel = make(chan bool)
 var captureWorkerDone = make(chan bool)
-var remoteCopyWorkerDone = make(chan bool)
 var capturedFrames = make(chan string, 4096)
 
 func captureFrame(filePath string) error {
@@ -63,9 +58,6 @@ func captureFrame(filePath string) error {
 	}
 
 	cmd := exec.Command("ffmpeg", args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
@@ -86,9 +78,6 @@ func compareFrames(path1 string, path2 string, diffPath string) (int, error) {
 	}
 
 	cmd := exec.Command("compare", args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
 		return 0, errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
@@ -113,9 +102,6 @@ func remoteCopy(path string, opts CommandLineOptions) error {
 	args = append(args, opts.RemoteDir)
 
 	cmd := exec.Command("scp", args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
@@ -129,14 +115,6 @@ func captureWorker(opts CommandLineOptions) {
 	burstMode := false
 
 	for {
-		select {
-		case _ = <-captureWorkerStopChannel:
-			fmt.Println("Capture worker stopped.")
-			captureWorkerDone <- true
-			return
-		default:
-		}
-
 		now := time.Now()
 		baseName := "cap_" + now.Format("20060102T150405") + "_" + fmt.Sprintf("%09d", now.Nanosecond())
 		framePath := opts.FrameDirPath + "/" + baseName + ".jpg"
@@ -185,14 +163,6 @@ func captureWorker(opts CommandLineOptions) {
 
 func remoteCopyWorker(opts CommandLineOptions) {
 	for {
-		select {
-		case _ = <-remoteCopyWorkerStopChannel:
-			fmt.Println("Remote copy worker stopped.")
-			remoteCopyWorkerDone <- true
-			return
-		default:
-		}
-
 		capturedFrame := <-capturedFrames
 		err := remoteCopy(capturedFrame, opts)
 		if err != nil {
@@ -317,15 +287,6 @@ func main() {
 
 	os.MkdirAll(opts.FrameDirPath, 0700)
 
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt)
-	signal.Notify(signalChan, syscall.SIGTERM)
-	go func() {
-		<-signalChan
-		fmt.Println("Receved Ctrl+C: Stopping capture worker...")
-		captureWorkerStopChannel <- true
-	}()
-
 	go captureWorker(opts)
 	go cleanUpLocalFilesWorker(opts)
 
@@ -335,9 +296,4 @@ func main() {
 	}
 
 	<-captureWorkerDone
-	if opts.RemoteDir != "" {
-		fmt.Println("Stopping remote copy worker...")
-		remoteCopyWorkerStopChannel <- true
-		<-remoteCopyWorkerDone
-	}
 }
