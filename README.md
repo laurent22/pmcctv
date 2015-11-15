@@ -32,14 +32,11 @@ Note: in many systems `avconv` (libav) is installed instead of ffmpeg. However s
  
 ### Windows
 
-(Not tested)
-
 * Install Go from https://golang.org/doc/install
-* Install [Cygwin](https://www.cygwin.com/) or [MinGW](http://www.mingw.org/)
 * Install [ffmpeg](http://ffmpeg.zeranoe.com/builds/)
 * Install [ImageMagick](http://www.imagemagick.org/script/binary-releases.php)
 
-From Cygwin, run `go get -u github.com/laurent22/pmcctv && go install github.com/laurent22/pmcctv`
+From a command line prompt, run `go get -u github.com/laurent22/pmcctv && go install github.com/laurent22/pmcctv`
 
 ## Usage
 

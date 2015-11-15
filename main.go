@@ -22,24 +22,26 @@ type CommandLineOptions struct {
 	RemotePort        string `short:"p" long:"remote-port" description:"Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
 	BurstModeDuration int    `short:"b" long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether. Default: 10"`
 	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days. Default: 7"`
+	InputDevice       string `short:"i" long:"input-device" description:"Name of capture input device. Default: auto-detect, except on Windows"`
 }
 
 var useRsync = false
 var captureWorkerDone = make(chan bool)
 var capturedFrames = make(chan string, 4096)
 
-func captureFrame(filePath string) error {
+func captureFrame(filePath string, inputDevice string) error {
 	// Linux: ffmpeg -y -loglevel fatal -f video4linux2 -i /dev/video0 -r 1 -t 0.0001 $FILENAME
 	// OSX: $FFMPEG -loglevel fatal -f avfoundation -i "" -r 1 -t 0.0001 $FILENAME
+	// Windows: ffmpeg -y -loglevel fatal -f dshow -i video="USB2.0 HD UVC WebCam" -r 1 -t 0.0001 test.jpg
 
 	var args []string
 
 	if runtime.GOOS == "linux" { // Linux
 		args = []string{
 			"-y",
-			"-loglevel", "fatal",
+			"-loglevel", "error",
 			"-f", "video4linux2",
-			"-i", "/dev/video0",
+			"-i", inputDevice,
 			"-r", "1",
 			"-t", "0.0001",
 			filePath,
@@ -47,9 +49,19 @@ func captureFrame(filePath string) error {
 	} else if runtime.GOOS == "darwin" { // OSX
 		args = []string{
 			"-y",
-			"-loglevel", "fatal",
+			"-loglevel", "error",
 			"-f", "avfoundation",
-			"-i", "",
+			"-i", inputDevice,
+			"-r", "1",
+			"-t", "0.0001",
+			filePath,
+		}
+	} else if runtime.GOOS == "windows" { // Windows
+		args = []string{
+			"-y",
+			"-loglevel", "error",
+			"-f", "dshow",
+			"-i", "video=" + inputDevice,
 			"-r", "1",
 			"-t", "0.0001",
 			filePath,
@@ -80,12 +92,19 @@ func compareFrames(path1 string, path2 string, diffPath string) (int, error) {
 
 	cmd := exec.Command("compare", args...)
 	buff, err := cmd.CombinedOutput()
-	if err != nil {
+	// On Windows, `compare` appears to always return an error code, even when successful
+	// so the `parseInt` code after that will take care of checking if it's really an 
+	// error or if it worked.
+	if err != nil && runtime.GOOS != "windows" {
 		return 0, errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
 	}
 
 	r, err := strconv.ParseInt(strings.Trim(string(buff), "\n\r\t "), 10, 64)
-	return int(r), err
+	if err != nil {
+		return 0, errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
+	}
+
+	return int(r), nil
 }
 
 func remoteCopy(path string, opts CommandLineOptions) error {
@@ -170,7 +189,7 @@ func captureWorker(opts CommandLineOptions) {
 		now := time.Now()
 		baseName := "cap_" + now.Format("20060102T150405") + "_" + fmt.Sprintf("%09d", now.Nanosecond())
 		framePath := opts.FrameDirPath + "/" + baseName + ".jpg"
-		err := captureFrame(framePath)
+		err := captureFrame(framePath, opts.InputDevice)
 		if err != nil {
 			fmt.Printf("Error: %s\n", err)
 			continue
@@ -347,6 +366,30 @@ func main() {
 
 	if opts.FramesTtl == 0 {
 		opts.FramesTtl = 7
+	}
+
+	if opts.InputDevice == "" {
+		if runtime.GOOS == "linux" {
+			opts.InputDevice = "/dev/video0"
+		} else if runtime.GOOS == "darwin" {
+			opts.InputDevice = ""
+		} else {
+			args = []string{
+				"-hide_banner",
+				"-list_devices",
+				"true",
+				"-f", "dshow",
+				"-i", "dummy",
+			}
+			cmd := exec.Command("ffmpeg", args...)
+			buff, _ := cmd.CombinedOutput()
+			fmt.Println("Please specify the input device that should be used to capture the video. It can be any of the devices listed below under \"DirectShow video devices\":")
+			fmt.Println("")
+			fmt.Println("Then run the command again with the --input-device option. eg. pmcctv --input-device \"My USB WebCam\"")
+			fmt.Println("");
+			fmt.Println(string(buff))
+			os.Exit(1)
+		}
 	}
 
 	if opts.FrameDirPath == "" {
