@@ -1,5 +1,7 @@
 package main
 
+// TODO: check shellPath logic - doesn't support DOS paths
+
 import (
 	"errors"
 	"fmt"
@@ -17,12 +19,12 @@ import (
 
 type CommandLineOptions struct {
 	FfmpegPath        string `short:"m" long:"ffmpeg" description:"Path to ffmpeg."`
-	FrameDirPath      string `short:"d" long:"frame-dir" description:"Path to directory that will contain the capture frames. Default: ~/Pictures/pmcctv"`
+	FrameDirPath      string `short:"d" long:"frame-dir" description:"Path to directory that will contain the captured frames. Default: ~/Pictures/pmcctv"`
 	RemoteDir         string `short:"r" long:"remote-dir" description:"Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcctv)."`
 	RemotePort        string `short:"p" long:"remote-port" description:"Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
-	BurstModeDuration int    `short:"b" long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether. Default: 10"`
-	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days. Default: 7"`
-	InputDevice       string `short:"i" long:"input-device" description:"Name of capture input device. Default: auto-detect, except on Windows"`
+	BurstModeDuration int    `short:"b" long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether. Default: 10."`
+	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days. Default: 7."`
+	InputDevice       string `short:"i" long:"input-device" description:"Name of capture input device. Default: auto-detect, except on Windows."`
 }
 
 var useRsync = false
@@ -140,7 +142,7 @@ func multipleRemoteCopy(paths []string, opts CommandLineOptions) error {
 		args = append(args, "-a")
 
 		for _, path := range paths {
-			args = append(args, path)
+			args = append(args, shellPath(path))
 		}
 
 		if opts.RemotePort != "" {
@@ -159,7 +161,7 @@ func multipleRemoteCopy(paths []string, opts CommandLineOptions) error {
 		// 	scp <path> <remote_dir>
 
 		for _, path := range paths {
-			args = append(args, path)
+			args = append(args, shellPath(path))
 		}
 
 		if opts.RemotePort != "" {
@@ -316,16 +318,6 @@ func cleanUpRemoteFiles(opts CommandLineOptions) error {
 	return nil
 }
 
-func fileTime(filePath string) (time.Time, error) {
-	// /path/to/cap_20151023T113103_058764637.jpg
-	basename := filepath.Base(filePath)
-	s := strings.Split(basename, "_")
-	if len(s) <= 1 {
-		return time.Time{}, errors.New("Invalid filename: " + filePath)
-	}
-	return time.Parse("20060102T150405", s[1])
-}
-
 func commandIsAvailable(commandName string) bool {
 	err := exec.Command("type", commandName).Run()
 	if err == nil {
@@ -337,7 +329,36 @@ func commandIsAvailable(commandName string) bool {
 		}
 	}
 	return false
-} 
+}
+
+var cygwinCheckDone_ = false
+var isCygwin_ = false
+
+func isCygwin() bool {
+	if cygwinCheckDone_ {
+		return isCygwin_;
+	}
+	cygwinCheckDone_ = true
+	r, err := exec.Command("uname", "-o").CombinedOutput()
+	if err != nil {
+		isCygwin_ = false
+	} else {
+		isCygwin_ = strings.ToLower(strings.Trim(string(r), "\r\n\t ")) == "cygwin"
+	}
+	return isCygwin_
+}
+
+func shellPath(path string) string {
+	if isCygwin() {
+		r, err := exec.Command("cygpath", "-u", path).CombinedOutput()
+		if err != nil {
+			fmt.Println("Error: cannot convert Cygwin path: %s", path) 
+		}
+		return strings.Trim(string(r), "\r\n\t ")
+	}
+	
+	return filepath.ToSlash(path)
+}
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -404,6 +425,14 @@ func main() {
 	opts.FrameDirPath = strings.TrimRight(opts.FrameDirPath, "/")
 
 	os.MkdirAll(opts.FrameDirPath, 0700)
+
+	fmt.Printf("Input device: %s\n", opts.InputDevice)
+	fmt.Printf("Local frame dir: %s\n", opts.FrameDirPath)
+	if opts.RemoteDir != "" {
+		p := "Default"
+		if opts.RemotePort != "" { p = opts.RemotePort } 
+		fmt.Printf("Remote frame dir: %s Port: %s\n", opts.RemoteDir, p)
+	}
 
 	go captureWorker(opts)
 	go cleanUpLocalFilesWorker(opts)
