@@ -59,7 +59,6 @@ To stop the script, press Ctrl + C.
 
 ## TODO
 
-* Allow specifying the video capture source and format for ffmpeg (curently hardcoded)
 * Command line argument to specify the threshold for a frame to be kept.
 
 ## License
