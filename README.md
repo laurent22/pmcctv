@@ -17,7 +17,6 @@ Install Go from https://golang.org/doc/install
     brew install ffmpeg
     brew install imagemagick
     go get -u github.com/laurent22/pmcctv
-    go install github.com/laurent22/pmcctv
 
 ### Linux
 
@@ -26,7 +25,6 @@ Install Go from https://golang.org/doc/install
     sudo apt-get install ffmpeg
     sudo apt-get install imagemagick
     go get -u github.com/laurent22/pmcctv
-    go install github.com/laurent22/pmcctv
 
 Note: in many systems `avconv` (libav) is installed instead of ffmpeg. However since avconv video capture does not work well, only ffmpeg is supported.
  
@@ -36,7 +34,7 @@ Note: in many systems `avconv` (libav) is installed instead of ffmpeg. However s
 * Install [ffmpeg](http://ffmpeg.zeranoe.com/builds/)
 * Install [ImageMagick](http://www.imagemagick.org/script/binary-releases.php)
 
-From a command line prompt, run `go get -u github.com/laurent22/pmcctv && go install github.com/laurent22/pmcctv`
+From a command line prompt, run `go get -u github.com/laurent22/pmcctv`
 
 ## Usage
 
