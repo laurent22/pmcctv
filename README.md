@@ -59,6 +59,7 @@ To stop the script, press Ctrl + C.
 
 * Command line argument to specify the threshold for a frame to be kept.
 * Send an email when motion is detected.
+* Record actual video in burst mode, using https://trac.ffmpeg.org/wiki/Capture/Desktop
 
 ## License
 
