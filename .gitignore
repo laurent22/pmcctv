@@ -3,3 +3,5 @@ testdir
 pmcctv
 pmcctv.exe
 run.sh
+*.sublime-project
+*.sublime-workspace

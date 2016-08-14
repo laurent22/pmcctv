@@ -1,6 +1,9 @@
 package main
 
 // TODO: check shellPath logic - doesn't support DOS paths
+// Capture video files, split into x seconds parts: 
+// TODO: allow specifying the capture device
+
 
 import (
 	"errors"
@@ -18,20 +21,23 @@ import (
 )
 
 type CommandLineOptions struct {
-	FfmpegPath        string `short:"m" long:"ffmpeg" description:"Path to ffmpeg."`
+	FfmpegPath        string `short:"m" long:"ffmpeg" description:"Path to ffmpeg. Default: system ffmpeg."`
 	FrameDirPath      string `short:"d" long:"frame-dir" description:"Path to directory that will contain the captured frames. Default: ~/Pictures/pmcctv"`
 	RemoteDir         string `short:"r" long:"remote-dir" description:"Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcctv)."`
 	RemotePort        string `short:"p" long:"remote-port" description:"Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
 	BurstModeDuration int    `short:"b" long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether. Default: 10."`
+	BurstModeFormat   string `short:"f" long:"burst-mode-format" description:"Format of burst mode captured files, either \"image\" or \"video\". Default: \"video\"."`
 	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days. Default: 7."`
 	InputDevice       string `short:"i" long:"input-device" description:"Name of capture input device. Default: auto-detect, except on Windows."`
 }
 
 var useRsync = false
 var captureWorkerDone = make(chan bool)
-var capturedFrames = make(chan string, 4096)
+var burstModeEnabled = make(chan bool)
+var burstModeDisabled = make(chan bool)
+var filesToUpload = make(chan string, 4096)
 
-func captureFrame(filePath string, inputDevice string) error {
+func captureFrame(ffmpegPath string, filePath string, inputDevice string) error {
 	// Linux: ffmpeg -y -loglevel fatal -f video4linux2 -i /dev/video0 -r 1 -t 0.0001 $FILENAME
 	// OSX: $FFMPEG -loglevel fatal -f avfoundation -i "" -r 1 -t 0.0001 $FILENAME
 	// Windows: ffmpeg -y -loglevel fatal -f dshow -i video="USB2.0 HD UVC WebCam" -r 1 -t 0.0001 test.jpg
@@ -48,7 +54,7 @@ func captureFrame(filePath string, inputDevice string) error {
 			"-t", "0.0001",
 			filePath,
 		}
-	} else if runtime.GOOS == "darwin" { // OSX
+	} else if runtime.GOOS == "darwin" { // Mac OS
 		args = []string{
 			"-y",
 			"-loglevel", "error",
@@ -72,13 +78,48 @@ func captureFrame(filePath string, inputDevice string) error {
 		panic("Unsupported OS: " + runtime.GOOS)
 	}
 
-	cmd := exec.Command("ffmpeg", args...)
+	cmd := exec.Command(ffmpegPath, args...)
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
 	}
 
 	return nil
+}
+
+func captureVideo(ffmpegPath string, filePath string, inputDevice string) (*exec.Cmd, error) {
+	// Linux: TODO
+	// OSX: TODO
+	// Windows: ffmpeg -y -f vfwcap -r 25 -i 0 -segment_time 1 -f segment "capture-%03d.flv"
+
+	var args []string
+
+	if runtime.GOOS == "linux" { // Linux
+		panic("Not implemented: " + runtime.GOOS)
+	} else if runtime.GOOS == "darwin" { // Mac OS
+		panic("Not implemented: " + runtime.GOOS)
+	} else if runtime.GOOS == "windows" { // Windows
+		args = []string{
+			"-y",
+			"-loglevel", "error",
+			"-f", "vfwcap",
+			"-r", "30",
+			"-i", "0",
+			"-segment_time", "5",
+			"-f", "segment",
+			filePath,
+		}
+	} else {
+		panic("Unsupported OS: " + runtime.GOOS)
+	}
+
+	cmd := exec.Command(ffmpegPath, args...)
+	err := cmd.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	return cmd, nil
 }
 
 func compareFrames(path1 string, path2 string, diffPath string) (int, error) {
@@ -182,6 +223,92 @@ func multipleRemoteCopy(paths []string, opts CommandLineOptions) error {
 	return nil
 }
 
+func fileSize(filePath string) (int64, error) {
+	file, err := os.Open(filePath) 
+	if err != nil {
+		return 0, err
+	}
+	fi, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+func captureVideoWorker(opts CommandLineOptions) {
+	var cmd *exec.Cmd
+	var err error
+	var videoFileBasePath string
+	uploadedVideoFiles := make(map[string]bool)
+	commandHasFinished := false
+
+	for {
+		select {
+
+		case <-burstModeEnabled:
+
+			fmt.Printf("Burst mode: capturing video for %d seconds...\n", opts.BurstModeDuration)
+			commandHasFinished = false
+			videoFileBasePath = opts.FrameDirPath + "/cap_" + time.Now().Format("20060102T150405") + "_"
+			// Need to record in flv format since it's more robust and
+			// doesn't result in a corrupted file when killing the ffmpeg process.
+			// Perhaps other formats have this benefit too (mp4 doesn't).
+			videoPath := videoFileBasePath + "%03d.flv"
+			cmd, err = captureVideo(opts.FfmpegPath, videoPath, "")
+			if err != nil {
+				fmt.Printf("Video capture error: %s\n", err)
+			}
+
+		case <-burstModeDisabled:
+			
+			if cmd != nil {
+				cmd.Process.Kill()
+				cmd = nil
+			}
+			commandHasFinished = true
+			fmt.Println("Burst mode: done capturing video.")
+
+		default:
+
+			// Upload the videos if the video capture command is currently running
+			// or if it has just finished running (to upload the last video that
+			// was just recorded).
+
+			if cmd != nil || commandHasFinished {
+				commandHasFinished = false
+
+				filePaths, err := filepath.Glob(videoFileBasePath + "*.flv")
+				if err != nil {
+					fmt.Printf("Cannot retrieve video file paths: %s\n", err)
+					continue;
+				}
+
+				for _, filePath := range filePaths {
+					s, err := fileSize(filePath)
+					if err != nil {
+						fmt.Printf("Cannot retrieve video file size: %s\n", err)
+						continue
+					}
+
+					// The key is <filename>_<filesize>. This is because files are being uploaded
+					// as they are being created by ffmpeg, so on the first upload we might upload only
+					// a partial file. On the next loop we check again the size - if it has changed,
+					// we upload again, etc. If it hasn't changed, it means ffmepg has started creating
+					// the next video segment.
+					k := fmt.Sprintf("%s_%d", filePath, s)
+					if _, ok := uploadedVideoFiles[k]; ok {
+						continue
+					}
+					uploadedVideoFiles[k] = true
+					filesToUpload <- filePath
+				}
+
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+	}
+}
+
 func captureWorker(opts CommandLineOptions) {
 	previousFramePath := ""
 	lastMotionTime := time.Now().Add(-60 * time.Second)
@@ -189,41 +316,65 @@ func captureWorker(opts CommandLineOptions) {
 
 	for {
 		now := time.Now()
-		baseName := "cap_" + now.Format("20060102T150405") + "_" + fmt.Sprintf("%09d", now.Nanosecond())
-		framePath := opts.FrameDirPath + "/" + baseName + ".jpg"
-		err := captureFrame(framePath, opts.InputDevice)
-		if err != nil {
-			fmt.Printf("Error: %s\n", err)
-			continue
-		}
 
-		if previousFramePath != "" {
-			diff, err := compareFrames(previousFramePath, framePath, framePath+".diff.png")
+
+		if burstMode && opts.BurstModeFormat == "video" {
+
+		} else {
+			baseName := "cap_" + now.Format("20060102T150405") + "_" + fmt.Sprintf("%09d", now.Nanosecond())
+			framePath := opts.FrameDirPath + "/" + baseName + ".jpg"
+			err := captureFrame(opts.FfmpegPath, framePath, opts.InputDevice)
 			if err != nil {
 				fmt.Printf("Error: %s\n", err)
-				diff = 9999999
+				continue
 			}
-			os.Remove(framePath + ".diff.png")
-			burstModeMarker := ""
-			if burstMode {
-				burstModeMarker = "[BM] "
-			}
-			if diff <= 20 {
-				fmt.Printf(burstModeMarker+"Same as previous image: delete (Diff = %d)\n", diff)
-				os.Remove(framePath)
+
+			if previousFramePath != "" {
+				diff, err := compareFrames(previousFramePath, framePath, framePath+".diff.png")
+				if err != nil {
+					fmt.Printf("Error: %s\n", err)
+					diff = 9999999
+				}
+				os.Remove(framePath + ".diff.png")
+				burstModeMarker := ""
+				if burstMode {
+					burstModeMarker = "[BM] "
+				}
+				// if diff <= 20 {
+				if diff <= 5000 {
+					fmt.Printf(burstModeMarker+"Same as previous image: delete (Diff = %d)\n", diff)
+					os.Remove(framePath)
+				} else {
+					fmt.Printf(burstModeMarker+"Different image: keep (Diff = %d)\n", diff)
+					filesToUpload <- framePath
+					previousFramePath = framePath
+					lastMotionTime = now
+				}
 			} else {
-				fmt.Printf(burstModeMarker+"Different image: keep (Diff = %d)\n", diff)
-				capturedFrames <- framePath
+				filesToUpload <- framePath
 				previousFramePath = framePath
-				lastMotionTime = now
 			}
-		} else {
-			capturedFrames <- framePath
-			previousFramePath = framePath
 		}
 
+
+
+		// If video capture is enabled:
+		// 		 Start capturing video
+		//       Don't capture still images, and don't run compareFrames()
+		//       After BurstModeDuration has elapsed, kill command, capture another frame and check if same as last capture frame.
+		//           If different => continue BurstMode with video capture
+		//           Otherwise => back to regular loop
+
 		if opts.BurstModeDuration >= 0 {
+			previousBurstMode := burstMode
 			burstMode = now.Sub(lastMotionTime) <= time.Duration(opts.BurstModeDuration)*time.Second
+			if burstMode != previousBurstMode {
+				if burstMode {
+					burstModeEnabled <- true
+				} else {
+					burstModeDisabled <- true
+				}
+			}
 		}
 
 		waitingTime := 1000 * time.Millisecond
@@ -237,13 +388,13 @@ func captureWorker(opts CommandLineOptions) {
 func remoteCopyWorker(opts CommandLineOptions) {
 	for {
 		var paths []string
-		itemCount := len(capturedFrames)
+		itemCount := len(filesToUpload)
 		if itemCount <= 0 {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		for i := 0; i < itemCount; i++ {
-			f := <-capturedFrames
+			f := <-filesToUpload
 			paths = append(paths, f)
 		}
 
@@ -385,6 +536,14 @@ func main() {
 		opts.BurstModeDuration = 10
 	}
 
+	if opts.BurstModeFormat == "" {
+		opts.BurstModeFormat = "video"
+	}
+
+	if opts.FfmpegPath == "" {
+		opts.FfmpegPath = "ffmpeg"
+	}
+
 	if opts.FramesTtl == 0 {
 		opts.FramesTtl = 7
 	}
@@ -434,6 +593,7 @@ func main() {
 		fmt.Printf("Remote frame dir: %s Port: %s\n", opts.RemoteDir, p)
 	}
 
+	go captureVideoWorker(opts)
 	go captureWorker(opts)
 	go cleanUpLocalFilesWorker(opts)
 
