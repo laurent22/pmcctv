@@ -3,7 +3,11 @@ package main
 // TODO: check shellPath logic - doesn't support DOS paths
 // Capture video files, split into x seconds parts: 
 // TODO: allow specifying the capture device
-
+// TODO: before running pmcctv, check that the specified video capture device exists and is working
+// TODO: set burst mode to 0 to disable
+// TODO: specify default in command
+// TODO: auto detect device on Windows
+// TODO: "init" to setup pmcctv with good settings
 
 import (
 	"errors"
@@ -12,6 +16,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,15 +25,19 @@ import (
 	"github.com/jessevdk/go-flags"
 )
 
-type CommandLineOptions struct {
-	FfmpegPath        string `short:"m" long:"ffmpeg" description:"Path to ffmpeg. Default: system ffmpeg."`
-	FrameDirPath      string `short:"d" long:"frame-dir" description:"Path to directory that will contain the captured frames. Default: ~/Pictures/pmcctv"`
+type StartCommandOptions struct {
+	FfmpegPath        string `short:"m" long:"ffmpeg" description:"Path to ffmpeg." default:"ffmpeg"`
+	FrameDirPath      string `short:"d" long:"frame-dir" description:"Path to directory that will contain the captured frames. (default: <PictureDirectory>/pmcctv)"`
 	RemoteDir         string `short:"r" long:"remote-dir" description:"Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcctv)."`
 	RemotePort        string `short:"p" long:"remote-port" description:"Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
-	BurstModeDuration int    `short:"b" long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether. Default: 10."`
-	BurstModeFormat   string `short:"f" long:"burst-mode-format" description:"Format of burst mode captured files, either \"image\" or \"video\". Default: \"video\"."`
-	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days. Default: 7."`
-	InputDevice       string `short:"i" long:"input-device" description:"Name of capture input device. Default: auto-detect, except on Windows."`
+	BurstModeDuration int    `short:"b" long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether." default:"10"`
+	BurstModeFormat   string `short:"f" long:"burst-mode-format" description:"Format of burst mode captured files, either \"image\" or \"video\"." default:"video"`
+	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days." default:"7"`
+	InputDevice       string `short:"i" long:"input-device" description:"Name of capture input device. Default: auto-detect."`
+}
+
+type CommandLineOptions struct {
+	Version bool `short:"v" long:"version" description:"Display version information"`
 }
 
 var useRsync = false
@@ -150,7 +159,7 @@ func compareFrames(path1 string, path2 string, diffPath string) (int, error) {
 	return int(r), nil
 }
 
-func remoteCopy(path string, opts CommandLineOptions) error {
+func remoteCopy(path string, opts StartCommandOptions) error {
 	// 	scp <path> <remote_dir>
 
 	args := []string{
@@ -173,7 +182,7 @@ func remoteCopy(path string, opts CommandLineOptions) error {
 	return nil
 }
 
-func multipleRemoteCopy(paths []string, opts CommandLineOptions) error {
+func multipleRemoteCopy(paths []string, opts StartCommandOptions) error {
 	args := []string{}
 
 	// It only makes sense to use rsync if there's more than one file to transfer
@@ -235,7 +244,7 @@ func fileSize(filePath string) (int64, error) {
 	return fi.Size(), nil
 }
 
-func captureVideoWorker(opts CommandLineOptions) {
+func captureVideoWorker(opts StartCommandOptions) {
 	var cmd *exec.Cmd
 	var err error
 	var videoFileBasePath string
@@ -309,7 +318,7 @@ func captureVideoWorker(opts CommandLineOptions) {
 	}
 }
 
-func captureWorker(opts CommandLineOptions) {
+func captureWorker(opts StartCommandOptions) {
 	previousFramePath := ""
 	lastMotionTime := time.Now().Add(-60 * time.Second)
 	burstMode := false
@@ -385,7 +394,7 @@ func captureWorker(opts CommandLineOptions) {
 	}
 }
 
-func remoteCopyWorker(opts CommandLineOptions) {
+func remoteCopyWorker(opts StartCommandOptions) {
 	for {
 		var paths []string
 		itemCount := len(filesToUpload)
@@ -405,21 +414,21 @@ func remoteCopyWorker(opts CommandLineOptions) {
 	}
 }
 
-func cleanUpLocalFilesWorker(opts CommandLineOptions) {
+func cleanUpLocalFilesWorker(opts StartCommandOptions) {
 	for {
 		cleanUpLocalFiles(opts)
 		time.Sleep(1 * time.Hour)
 	}
 }
 
-func cleanUpRemoteFilesWorker(opts CommandLineOptions) {
+func cleanUpRemoteFilesWorker(opts StartCommandOptions) {
 	for {
 		cleanUpRemoteFiles(opts)
 		time.Sleep(1 * time.Hour)
 	}
 }
 
-func cleanUpLocalFiles(opts CommandLineOptions) error {
+func cleanUpLocalFiles(opts StartCommandOptions) error {
 	args := []string{}
 	args = appendCleanUpFindCommandArgs(args, opts.FrameDirPath, opts.FramesTtl)
 	cmd := exec.Command("find", args...)
@@ -441,7 +450,7 @@ func appendCleanUpFindCommandArgs(args []string, dir string, framesTtl int) []st
 	return args
 }
 
-func cleanUpRemoteFiles(opts CommandLineOptions) error {
+func cleanUpRemoteFiles(opts StartCommandOptions) error {
 	args := []string{}
 
 	s := strings.Split(opts.RemoteDir, ":")
@@ -511,30 +520,68 @@ func shellPath(path string) string {
 	return filepath.ToSlash(path)
 }
 
+func checkDependencies(opts StartCommandOptions) error {
+	var s []string
+	if !commandIsAvailable(opts.FfmpegPath) {
+		s = append(s, "\"ffmpeg\" command not found. Please install it or specify the path via the --ffmpeg parameter.")
+	}
+	if !commandIsAvailable("compare") {
+		s = append(s, "\"compare\" command not found. Please install the ImageMagick package on your system.")
+	}
+	if !commandIsAvailable("identify") {
+		s = append(s, "\"identify\" command not found. Please install the ImageMagick package on your system.")
+	}
+	if len(s) > 0 {
+		return errors.New(strings.Join(s, "\n"))
+	} else {
+		return nil
+	}	
+}
+
+func printHelp(flagParser *flags.Parser) {
+	flagParser.WriteHelp(os.Stdout)
+	fmt.Printf("\n")
+	fmt.Printf("For help with a particular command, type \"%s <command> --help\"\n", path.Base(os.Args[0]))	
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	var err error
 
-	var opts CommandLineOptions
-	flagParser := flags.NewParser(&opts, flags.HelpFlag|flags.PassDoubleDash)
+	var opts StartCommandOptions
+	var commandLineOptions CommandLineOptions
+	flagParser := flags.NewParser(&commandLineOptions, flags.HelpFlag|flags.PassDoubleDash)
+
+	flagParser.AddCommand(
+		"start",
+		"Start monitoring",
+		"This is the main command, which is used to initialize pmcctv and start capturing video and monitoring.",
+		&opts,
+	)
+
 	args, err := flagParser.Parse()
 	if err != nil {
 		t := err.(*flags.Error).Type
 		if t == flags.ErrHelp {
-			flagParser.WriteHelp(os.Stdout)
+			printHelp(flagParser)
+			os.Exit(0)
+		} else if t == flags.ErrCommandRequired {
+			// Here handle default flags (which are not associated with any command)
+			if commandLineOptions.Version {
+				// TODO: Print version and exit
+				os.Exit(0)
+			}
+			printHelp(flagParser)
 			os.Exit(0)
 		} else {
 			fmt.Printf("Error: %s\n", err)
+			fmt.Printf("Type '%s --help' for more information.\n", path.Base(os.Args[0]))
 			os.Exit(1)
 		}
 	}
 
 	_ = args
-
-	if opts.BurstModeDuration == 0 {
-		opts.BurstModeDuration = 10
-	}
 
 	if opts.BurstModeFormat == "" {
 		opts.BurstModeFormat = "video"
@@ -582,6 +629,15 @@ func main() {
 	}
 
 	opts.FrameDirPath = strings.TrimRight(opts.FrameDirPath, "/")
+
+	err = checkDependencies(opts)
+
+	if err != nil {
+		fmt.Println("Some dependencies are missing. Please install them before continuing:")
+		fmt.Println("")
+		fmt.Println(err.Error())
+		os.Exit(1)
+	}
 
 	os.MkdirAll(opts.FrameDirPath, 0700)
 
