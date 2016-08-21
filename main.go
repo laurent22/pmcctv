@@ -1,8 +1,10 @@
 package main
 
 // TODO: check shellPath logic - doesn't support DOS paths
-// Capture video files, split into x seconds parts: 
 // TODO: allow specifying the capture device
+// TODO: specify tolerance as a percentage (currently set to number of different pixels)
+// TODO: add video support for Linux
+// TODO: add video support for Mac OS
 
 
 import (
@@ -68,8 +70,10 @@ func captureFrame(ffmpegPath string, filePath string, inputDevice string) error 
 		args = []string{
 			"-y",
 			"-loglevel", "error",
-			"-f", "dshow",
-			"-i", "video=" + inputDevice,
+			// "-f", "dshow",
+			"-f", "vfwcap",
+			// "-i", "video=" + inputDevice,
+			"-i", "0",
 			"-r", "1",
 			"-t", "0.0001",
 			filePath,
@@ -81,7 +85,8 @@ func captureFrame(ffmpegPath string, filePath string, inputDevice string) error 
 	cmd := exec.Command(ffmpegPath, args...)
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
-		return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
+		println(string(buff))
+		return errors.New(fmt.Sprintf("ffmpeg: %s. %s. Command was: \"%s\" %s", err, string(buff), ffmpegPath, strings.Join(args, " ")))
 	}
 
 	return nil
@@ -151,7 +156,7 @@ func compareFrames(path1 string, path2 string, diffPath string) (int, error) {
 }
 
 func remoteCopy(path string, opts CommandLineOptions) error {
-	// 	scp <path> <remote_dir>
+	// scp <path> <remote_dir>
 
 	args := []string{
 		path,
@@ -199,7 +204,7 @@ func multipleRemoteCopy(paths []string, opts CommandLineOptions) error {
 			return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
 		}
 	} else {
-		// 	scp <path> <remote_dir>
+		// scp <path> <remote_dir>
 
 		for _, path := range paths {
 			args = append(args, shellPath(path))
@@ -435,6 +440,8 @@ func appendCleanUpFindCommandArgs(args []string, dir string, framesTtl int) []st
 	args = append(args, dir)
 	args = append(args, "-name")
 	args = append(args, "cap_*.jpg")
+	args = append(args, "-o")
+	args = append(args, "cap_*.flv")
 	args = append(args, "-mtime")
 	args = append(args, "+"+strconv.Itoa(framesTtl))
 	args = append(args, "-delete")
@@ -593,9 +600,12 @@ func main() {
 		fmt.Printf("Remote frame dir: %s Port: %s\n", opts.RemoteDir, p)
 	}
 
-	go captureVideoWorker(opts)
 	go captureWorker(opts)
 	go cleanUpLocalFilesWorker(opts)
+
+	if opts.BurstModeFormat == "video" {
+		go captureVideoWorker(opts)
+	}
 
 	if opts.RemoteDir != "" {
 		useRsync = commandIsAvailable("rsync")
