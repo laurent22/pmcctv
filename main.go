@@ -1,17 +1,33 @@
 package main
 
 // TODO: check shellPath logic - doesn't support DOS paths
+// Capture video files, split into x seconds parts: 
 // TODO: allow specifying the capture device
-// TODO: specify tolerance as a percentage (currently set to number of different pixels)
-// TODO: add video support for Linux
-// TODO: add video support for Mac OS
 // TODO: before running pmcctv, check that the specified video capture device exists and is working
-// TODO: set burst mode to 0 to disable
-// TODO: specify default in command
 // TODO: auto detect device on Windows
 // TODO: "init" to setup pmcctv with good settings
+// TODO: force pub key auth over SSH (since it's hard to automate anything otherwise)? -o PreferredAuthentications=pubkey -o PasswordAuthentication=no -o PubkeyAuthentication=yes
+// TODO: refactor burstModeEnabled, so that it's an event that any worker can respond to. Currently, only videoWorker respond to it, and, if not running, the channel update block the application.
+
+// # Setup the server
+//
+// The server is optional but is convenient to view the captured videos and images.
+// 
+// 1. Copy the file index.php to your server.
+// 2. Open the file index.php in a URL. For example, https://yourserver.com/path/to/index.php
+// 3. Since not configuration is currently defined, it will ask you to create one. To do so, follow the instructions on screen.
+// 4. Create the config.php file as instructed and upload it in the same directory as your server. 
+//
+// # Setup the command line client
+// 
+// 1. Run `pmcctv init` to setup the various parameters, including selecting the correct webcam, specifying the remote location, etc.
+// 2. Run `pmcctv start` to start capturing frames.
+// 3. Run `pmcctv --help` for additional information
+
+
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -22,24 +38,39 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"log"
 	"time"
+	"image"
+	"net/smtp"
+
+    _ "image/jpeg"
+    _ "image/png"
 
 	"github.com/jessevdk/go-flags"
 )
 
+const VERSION = "1.0.0"
+
 type StartCommandOptions struct {
-	FfmpegPath        string `short:"m" long:"ffmpeg" description:"Path to ffmpeg." default:"ffmpeg"`
-	FrameDirPath      string `short:"d" long:"frame-dir" description:"Path to directory that will contain the captured frames. (default: <PictureDirectory>/pmcctv)"`
-	RemoteDir         string `short:"r" long:"remote-dir" description:"Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcctv)."`
-	RemotePort        string `short:"p" long:"remote-port" description:"Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
-	BurstModeDuration int    `short:"b" long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to -1 to disable burst mode altogether." default:"10"`
-	BurstModeFormat   string `short:"f" long:"burst-mode-format" description:"Format of burst mode captured files, either \"image\" or \"video\"." default:"video"`
-	FramesTtl         int    `short:"t" long:"time-to-live" description:"For how long captured frames should be kept, in days." default:"7"`
-	InputDevice       string `short:"i" long:"input-device" description:"Name of capture input device. Default: auto-detect."`
+	FfmpegPath        string   `          long:"ffmpeg" description:"Path to ffmpeg." default:"ffmpeg"`
+	FrameDirPath       string  `short:"d" long:"frame-dir" description:"Path to directory that will contain the captured frames. (default: <PictureDirectory>/pmcctv)"`
+	RemoteDir          string  `short:"r" long:"remote-dir" description:"Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcctv)."`
+	RemotePort         string  `short:"p" long:"remote-port" description:"Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
+	BurstModeDuration  int     `          long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to 0 to disable burst mode altogether." default:"30"`
+	BurstModeFormat    string  `          long:"burst-mode-format" description:"Format of burst mode captured files, either \"image\" or \"video\"." default:"video"`
+	BurstModeThreshold float32 `         long:"burst-mode-threshold" description:"How different two successive frames must be (as a percentage) for Burst Mode to be enabled." default:"1.0"`
+	FramesTtl          int     `          long:"time-to-live" description:"For how long captured frames should be kept, in days." default:"7"`
+	InputDeviceFormat  string  `short:"f" long:"input-device-format" description:"Format of capture input device. (default: auto-detect)"`
+	InputDevice        string  `short:"i" long:"input-device" description:"Name of capture input device. (default: auto-detect)"`
 }
 
-type CommandLineOptions struct {
-	Version bool `short:"v" long:"version" description:"Display version information"`
+type AppCommandOptions struct {
+	Version bool `long:"version" description:"Display version information"`
+}
+
+type CommandOptions struct {
+	App AppCommandOptions
+	Start StartCommandOptions
 }
 
 var useRsync = false
@@ -47,8 +78,50 @@ var captureWorkerDone = make(chan bool)
 var burstModeEnabled = make(chan bool)
 var burstModeDisabled = make(chan bool)
 var filesToUpload = make(chan string, 4096)
+var lastEmailTime = time.Time{}
+var captureStartTime = time.Time{}
 
-func captureFrame(ffmpegPath string, filePath string, inputDevice string) error {
+func imageDimensions(imagePath string) (int, int, error) {
+	file, err := os.Open(imagePath)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	defer file.Close()
+
+	image, _, err := image.DecodeConfig(file)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return image.Width, image.Height, nil
+}
+
+func sendEmail() {
+	now := time.Now()
+
+	if now.Sub(captureStartTime) > time.Duration(60) * time.Second && (lastEmailTime.IsZero() || now.Sub(lastEmailTime) > time.Duration(20) * time.Second) {
+		log.Println("Sending email...")
+
+		msg := "From: " + from + "\n" +
+			"To: " + to + "\n" +
+			"Subject: Motion detected\n\n" +
+			body
+
+		err := smtp.SendMail("smtp.gmail.com:587",
+			smtp.PlainAuth("", from, pass, "smtp.gmail.com"),
+			from, []string{to}, []byte(msg))
+
+		if err != nil {
+			log.Println("smtp error: %s", err)
+			return
+		}
+
+		lastEmailTime = now
+	}
+}
+
+func captureFrame(filePath string, opts StartCommandOptions) (error) {
 	// Linux: ffmpeg -y -loglevel fatal -f video4linux2 -i /dev/video0 -r 1 -t 0.0001 $FILENAME
 	// OSX: $FFMPEG -loglevel fatal -f avfoundation -i "" -r 1 -t 0.0001 $FILENAME
 	// Windows: ffmpeg -y -loglevel fatal -f dshow -i video="USB2.0 HD UVC WebCam" -r 1 -t 0.0001 test.jpg
@@ -56,21 +129,23 @@ func captureFrame(ffmpegPath string, filePath string, inputDevice string) error 
 	var args []string
 
 	if runtime.GOOS == "linux" { // Linux
+		// TODO: Fix input device and format
 		args = []string{
 			"-y",
 			"-loglevel", "error",
 			"-f", "video4linux2",
-			"-i", inputDevice,
+			"-i", opts.InputDevice,
 			"-r", "1",
 			"-t", "0.0001",
 			filePath,
 		}
 	} else if runtime.GOOS == "darwin" { // Mac OS
+		// TODO: Fix input device and format
 		args = []string{
 			"-y",
 			"-loglevel", "error",
 			"-f", "avfoundation",
-			"-i", inputDevice,
+			"-i", opts.InputDevice,
 			"-r", "1",
 			"-t", "0.0001",
 			filePath,
@@ -79,10 +154,14 @@ func captureFrame(ffmpegPath string, filePath string, inputDevice string) error 
 		args = []string{
 			"-y",
 			"-loglevel", "error",
+
+			"-f", opts.InputDeviceFormat,
+			"-i", opts.InputDevice,
+
 			// "-f", "dshow",
-			"-f", "vfwcap",
 			// "-i", "video=" + inputDevice,
-			"-i", "0",
+			// "-f", "vfwcap",
+			// "-i", "0",
 			"-r", "1",
 			"-t", "0.0001",
 			filePath,
@@ -91,17 +170,16 @@ func captureFrame(ffmpegPath string, filePath string, inputDevice string) error 
 		panic("Unsupported OS: " + runtime.GOOS)
 	}
 
-	cmd := exec.Command(ffmpegPath, args...)
+	cmd := exec.Command(opts.FfmpegPath, args...)
 	buff, err := cmd.CombinedOutput()
 	if err != nil {
-		println(string(buff))
-		return errors.New(fmt.Sprintf("ffmpeg: %s. %s. Command was: \"%s\" %s", err, string(buff), ffmpegPath, strings.Join(args, " ")))
+		return errors.New(fmt.Sprintf("ffmpeg: %s. %s. Command was: \"%s\" %s", err, string(buff), opts.FfmpegPath, strings.Join(args, " ")))
 	}
 
 	return nil
 }
 
-func captureVideo(ffmpegPath string, filePath string, inputDevice string) (*exec.Cmd, error) {
+func captureVideo(filePath string, opts StartCommandOptions) (*exec.Cmd, error) {
 	// Linux: TODO
 	// OSX: TODO
 	// Windows: ffmpeg -y -f vfwcap -r 25 -i 0 -segment_time 1 -f segment "capture-%03d.flv"
@@ -116,9 +194,12 @@ func captureVideo(ffmpegPath string, filePath string, inputDevice string) (*exec
 		args = []string{
 			"-y",
 			"-loglevel", "error",
-			"-f", "vfwcap",
+			"-f", opts.InputDeviceFormat,
+			"-i", opts.InputDevice,
+			// "-f", "vfwcap",
+			// "-i", "0",
 			"-r", "30",
-			"-i", "0",
+			"-c:v", "libvpx", // For Webm - https://trac.ffmpeg.org/wiki/Encode/VP8
 			"-segment_time", "5",
 			"-f", "segment",
 			filePath,
@@ -127,7 +208,7 @@ func captureVideo(ffmpegPath string, filePath string, inputDevice string) (*exec
 		panic("Unsupported OS: " + runtime.GOOS)
 	}
 
-	cmd := exec.Command(ffmpegPath, args...)
+	cmd := exec.Command(opts.FfmpegPath, args...)
 	err := cmd.Start()
 	if err != nil {
 		return nil, err
@@ -140,7 +221,7 @@ func compareFrames(path1 string, path2 string, diffPath string) (int, error) {
 	//compare -fuzz 20% -metric ae $PREVIOUS_FILENAME $FILENAME diff.png 2> $DIFF_RESULT_FILE
 
 	args := []string{
-		"-fuzz", "20%",
+		"-fuzz", "15%",
 		"-metric", "ae",
 		path1,
 		path2,
@@ -165,7 +246,7 @@ func compareFrames(path1 string, path2 string, diffPath string) (int, error) {
 }
 
 func remoteCopy(path string, opts StartCommandOptions) error {
-	// scp <path> <remote_dir>
+	// 	scp <path> <remote_dir>
 
 	args := []string{
 		path,
@@ -191,10 +272,11 @@ func multipleRemoteCopy(paths []string, opts StartCommandOptions) error {
 	args := []string{}
 
 	// It only makes sense to use rsync if there's more than one file to transfer
-	if useRsync && len(paths) > 1 {
+	// if useRsync && len(paths) > 1 {
 		// rsync -a <paths> <remote_dir>
 
 		args = append(args, "-a")
+		args = append(args, "--chmod=D700,F666")
 
 		for _, path := range paths {
 			args = append(args, shellPath(path))
@@ -209,30 +291,31 @@ func multipleRemoteCopy(paths []string, opts StartCommandOptions) error {
 
 		cmd := exec.Command("rsync", args...)
 		buff, err := cmd.CombinedOutput()
+
 		if err != nil {
 			return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
 		}
-	} else {
-		// scp <path> <remote_dir>
+	// } else {
+	// 	// 	scp <path> <remote_dir>
 
-		for _, path := range paths {
-			args = append(args, shellPath(path))
-		}
+	// 	for _, path := range paths {
+	// 		args = append(args, shellPath(path))
+	// 	}
 
-		if opts.RemotePort != "" {
-			args = append(args, "-P")
-			args = append(args, opts.RemotePort)
-		}
+	// 	if opts.RemotePort != "" {
+	// 		args = append(args, "-P")
+	// 		args = append(args, opts.RemotePort)
+	// 	}
 
-		args = append(args, opts.RemoteDir)
+	// 	args = append(args, opts.RemoteDir)
 
-		cmd := exec.Command("scp", args...)
-		buff, err := cmd.CombinedOutput()
-		if err != nil {
-			return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
-		}
+	// 	cmd := exec.Command("scp", args...)
+	// 	buff, err := cmd.CombinedOutput()
+	// 	if err != nil {
+	// 		return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
+	// 	}
 
-	}
+	// }
 	
 	return nil
 }
@@ -261,26 +344,34 @@ func captureVideoWorker(opts StartCommandOptions) {
 
 		case <-burstModeEnabled:
 
-			fmt.Printf("Burst mode: capturing video for %d seconds...\n", opts.BurstModeDuration)
+			if opts.BurstModeFormat != "video" {
+				break
+			}
+
+			log.Printf("Burst mode: capturing video for %d seconds...\n", opts.BurstModeDuration)
 			commandHasFinished = false
 			videoFileBasePath = opts.FrameDirPath + "/cap_" + time.Now().Format("20060102T150405") + "_"
 			// Need to record in flv format since it's more robust and
 			// doesn't result in a corrupted file when killing the ffmpeg process.
 			// Perhaps other formats have this benefit too (mp4 doesn't).
-			videoPath := videoFileBasePath + "%03d.flv"
-			cmd, err = captureVideo(opts.FfmpegPath, videoPath, "")
+			videoPath := videoFileBasePath + "%03d.webm"
+			cmd, err = captureVideo(videoPath, opts)
 			if err != nil {
-				fmt.Printf("Video capture error: %s\n", err)
+				log.Printf("Video capture error: %s\n", err)
 			}
 
 		case <-burstModeDisabled:
+
+			if opts.BurstModeFormat != "video" {
+				break
+			}
 			
 			if cmd != nil {
 				cmd.Process.Kill()
 				cmd = nil
 			}
 			commandHasFinished = true
-			fmt.Println("Burst mode: done capturing video.")
+			log.Println("Burst mode: done capturing video.")
 
 		default:
 
@@ -291,16 +382,16 @@ func captureVideoWorker(opts StartCommandOptions) {
 			if cmd != nil || commandHasFinished {
 				commandHasFinished = false
 
-				filePaths, err := filepath.Glob(videoFileBasePath + "*.flv")
+				filePaths, err := filepath.Glob(videoFileBasePath + "*.webm")
 				if err != nil {
-					fmt.Printf("Cannot retrieve video file paths: %s\n", err)
+					log.Printf("Cannot retrieve video file paths: %s\n", err)
 					continue;
 				}
 
 				for _, filePath := range filePaths {
 					s, err := fileSize(filePath)
 					if err != nil {
-						fmt.Printf("Cannot retrieve video file size: %s\n", err)
+						log.Printf("Cannot retrieve video file size: %s\n", err)
 						continue
 					}
 
@@ -319,7 +410,7 @@ func captureVideoWorker(opts StartCommandOptions) {
 
 				time.Sleep(500 * time.Millisecond)
 			}
-		}
+			}
 	}
 }
 
@@ -337,29 +428,35 @@ func captureWorker(opts StartCommandOptions) {
 		} else {
 			baseName := "cap_" + now.Format("20060102T150405") + "_" + fmt.Sprintf("%09d", now.Nanosecond())
 			framePath := opts.FrameDirPath + "/" + baseName + ".jpg"
-			err := captureFrame(opts.FfmpegPath, framePath, opts.InputDevice)
+			err := captureFrame(framePath, opts)
 			if err != nil {
-				fmt.Printf("Error: %s\n", err)
+				log.Printf("Error: %s\n", err)
+				continue
+			}
+
+			width, height, err := imageDimensions(framePath)
+			if err != nil {
+				log.Printf("Error: cannot get image dimensions: %s\n", err)
 				continue
 			}
 
 			if previousFramePath != "" {
 				diff, err := compareFrames(previousFramePath, framePath, framePath+".diff.png")
 				if err != nil {
-					fmt.Printf("Error: %s\n", err)
-					diff = 9999999
+					log.Printf("Error: %s\n", err)
+					diff = width * height
 				}
 				os.Remove(framePath + ".diff.png")
 				burstModeMarker := ""
 				if burstMode {
 					burstModeMarker = "[BM] "
 				}
-				// if diff <= 20 {
-				if diff <= 5000 {
-					fmt.Printf(burstModeMarker+"Same as previous image: delete (Diff = %d)\n", diff)
+				percentDiff := (float32(diff) / float32(width * height)) * 100
+				if percentDiff < opts.BurstModeThreshold {
+					log.Printf(burstModeMarker+"Same as previous image: delete (Diff = %.2f)\n", percentDiff)
 					os.Remove(framePath)
 				} else {
-					fmt.Printf(burstModeMarker+"Different image: keep (Diff = %d)\n", diff)
+					log.Printf(burstModeMarker+"Different image: keep (Diff = %.2f)\n", percentDiff)
 					filesToUpload <- framePath
 					previousFramePath = framePath
 					lastMotionTime = now
@@ -370,20 +467,19 @@ func captureWorker(opts StartCommandOptions) {
 			}
 		}
 
-
-
 		// If video capture is enabled:
-		// 		 Start capturing video
-		//       Don't capture still images, and don't run compareFrames()
-		//       After BurstModeDuration has elapsed, kill command, capture another frame and check if same as last capture frame.
-		//           If different => continue BurstMode with video capture
-		//           Otherwise => back to regular loop
+		//     - Start capturing video
+		//     - Don't capture still images, and don't run compareFrames()
+		//     - After BurstModeDuration has elapsed, kill command, capture another frame and check if same as last capture frame.
+		//         - If different => continue BurstMode with video capture
+		//         - Otherwise => back to regular loop
 
-		if opts.BurstModeDuration >= 0 {
+		if opts.BurstModeDuration > 0 {
 			previousBurstMode := burstMode
 			burstMode = now.Sub(lastMotionTime) <= time.Duration(opts.BurstModeDuration)*time.Second
 			if burstMode != previousBurstMode {
 				if burstMode {
+					sendEmail()
 					burstModeEnabled <- true
 				} else {
 					burstModeDisabled <- true
@@ -414,7 +510,7 @@ func remoteCopyWorker(opts StartCommandOptions) {
 
 		err := multipleRemoteCopy(paths, opts)
 		if err != nil {
-			fmt.Printf("Error: could not remote copy \"%s\": %s", paths, err)
+			log.Printf("Error: could not remote copy \"%s\": %s", paths, err)
 		}
 	}
 }
@@ -450,7 +546,13 @@ func appendCleanUpFindCommandArgs(args []string, dir string, framesTtl int) []st
 	args = append(args, "-name")
 	args = append(args, "cap_*.jpg")
 	args = append(args, "-o")
+	args = append(args, "cap_*.ogg")
+	args = append(args, "-o")
 	args = append(args, "cap_*.flv")
+	args = append(args, "-o")
+	args = append(args, "cap_*.mp4")
+	args = append(args, "-o")
+	args = append(args, "cap_*.webm")
 	args = append(args, "-mtime")
 	args = append(args, "+"+strconv.Itoa(framesTtl))
 	args = append(args, "-delete")
@@ -519,7 +621,7 @@ func shellPath(path string) string {
 	if isCygwin() {
 		r, err := exec.Command("cygpath", "-u", path).CombinedOutput()
 		if err != nil {
-			fmt.Println("Error: cannot convert Cygwin path: %s", path) 
+			log.Println("Error: cannot convert Cygwin path: %s", path) 
 		}
 		return strings.Trim(string(r), "\r\n\t ")
 	}
@@ -547,8 +649,43 @@ func checkDependencies(opts StartCommandOptions) error {
 
 func printHelp(flagParser *flags.Parser) {
 	flagParser.WriteHelp(os.Stdout)
-	fmt.Printf("\n")
-	fmt.Printf("For help with a particular command, type \"%s <command> --help\"\n", path.Base(os.Args[0]))	
+	log.Printf("\n")
+	log.Printf("For help with a particular command, type \"%s <command> --help\"\n", path.Base(os.Args[0]))	
+}
+
+func initCommand() {
+	reader := bufio.NewReader(os.Stdin)
+	log.Print("Enter video device:")
+	text, _ := reader.ReadString('\n')
+	log.Println(text)
+
+	args := []string{
+		"start",
+		"--input-device", "My Webcam",
+	}
+
+	var opts CommandOptions
+	flagParser := createFlagParser(&opts)
+
+	flagParser.ParseArgs(args)
+
+	iniParser := flags.NewIniParser(flagParser)
+	var iniOptions flags.IniOptions
+	iniParser.WriteFile("/home/laurent/src/pmcctv_server/client/test.ini", iniOptions)
+	os.Exit(0)
+}
+
+func createFlagParser(opts *CommandOptions) (*flags.Parser) {
+	flagParser := flags.NewParser(&opts.App, flags.HelpFlag|flags.PassDoubleDash)
+
+	flagParser.AddCommand(
+		"start",
+		"Start monitoring",
+		"This is the main command, which is used to initialize pmcctv and start capturing video and monitoring.",
+		&opts.Start,
+	)
+
+	return flagParser
 }
 
 func main() {
@@ -556,18 +693,21 @@ func main() {
 
 	var err error
 
-	var opts StartCommandOptions
-	var commandLineOptions CommandLineOptions
-	flagParser := flags.NewParser(&commandLineOptions, flags.HelpFlag|flags.PassDoubleDash)
-
-	flagParser.AddCommand(
-		"start",
-		"Start monitoring",
-		"This is the main command, which is used to initialize pmcctv and start capturing video and monitoring.",
-		&opts,
-	)
+	var opts CommandOptions
+	flagParser := createFlagParser(&opts)
 
 	args, err := flagParser.Parse()
+
+	//initCommand()
+
+	// cmd := exec.Command("scp", "-P", "2222", "/home/laurent/src/pmcctv_server/client/test.ini", "laurent@localhost:~/test_dest/")
+	// buff, err := cmd.CombinedOutput()
+	// log.Println(err)
+	// log.Println(string(buff))
+
+
+	// os.Exit(0)
+
 	if err != nil {
 		t := err.(*flags.Error).Type
 		if t == flags.ErrHelp {
@@ -575,98 +715,88 @@ func main() {
 			os.Exit(0)
 		} else if t == flags.ErrCommandRequired {
 			// Here handle default flags (which are not associated with any command)
-			if commandLineOptions.Version {
-				// TODO: Print version and exit
+			if opts.App.Version {
+				log.Println(VERSION)
 				os.Exit(0)
 			}
 			printHelp(flagParser)
 			os.Exit(0)
 		} else {
-			fmt.Printf("Error: %s\n", err)
-			fmt.Printf("Type '%s --help' for more information.\n", path.Base(os.Args[0]))
+			log.Printf("Error: %s\n", err)
+			log.Printf("Type '%s --help' for more information.\n", path.Base(os.Args[0]))
 			os.Exit(1)
 		}
 	}
 
 	_ = args
 
-	if opts.BurstModeFormat == "" {
-		opts.BurstModeFormat = "video"
-	}
-
-	if opts.FfmpegPath == "" {
-		opts.FfmpegPath = "ffmpeg"
-	}
-
-	if opts.FramesTtl == 0 {
-		opts.FramesTtl = 7
-	}
-
-	if opts.InputDevice == "" {
+	if opts.Start.InputDevice == "" {
 		if runtime.GOOS == "linux" {
-			opts.InputDevice = "/dev/video0"
+			opts.Start.InputDevice = "/dev/video0"
 		} else if runtime.GOOS == "darwin" {
-			opts.InputDevice = ""
+			opts.Start.InputDevice = ""
 		} else {
-			args = []string{
-				"-hide_banner",
-				"-list_devices",
-				"true",
-				"-f", "dshow",
-				"-i", "dummy",
-			}
-			cmd := exec.Command("ffmpeg", args...)
-			buff, _ := cmd.CombinedOutput()
-			fmt.Println("Please specify the input device that should be used to capture the video. It can be any of the devices listed below under \"DirectShow video devices\":")
-			fmt.Println("")
-			fmt.Println("Then run the command again with the --input-device option. eg. pmcctv --input-device \"My USB WebCam\"")
-			fmt.Println("");
-			fmt.Println(string(buff))
-			os.Exit(1)
+			// args = []string{
+			// 	"-hide_banner",
+			// 	"-list_devices",
+			// 	"true",
+			// 	"-f", "dshow",
+			// 	"-i", "dummy",
+			// }
+			// cmd := exec.Command("ffmpeg", args...)
+			// buff, _ := cmd.CombinedOutput()
+			// log.Println("Please specify the input device that should be used to capture the video. It can be any of the devices listed below under \"DirectShow video devices\":")
+			// log.Println("")
+			// log.Println("Then run the command again with the --input-device option. eg. pmcctv --input-device \"My USB WebCam\"")
+			// log.Println("");
+			// log.Println(string(buff))
+			// os.Exit(1)
 		}
 	}
 
-	if opts.FrameDirPath == "" {
+	if opts.Start.FrameDirPath == "" {
 		u, err := user.Current()
 		if err != nil {
-			fmt.Println("No frame dir specified and cannot detect default Pictures dir. Please specify it with the --frame-dir option")
+			log.Println("No frame dir specified and cannot detect default Pictures dir. Please specify it with the --frame-dir option")
 			os.Exit(1)
 		}
-		opts.FrameDirPath = u.HomeDir + "/Pictures/pmcctv"
+		opts.Start.FrameDirPath = u.HomeDir + "/Pictures/pmcctv"
 	}
 
-	opts.FrameDirPath = strings.TrimRight(opts.FrameDirPath, "/")
+	opts.Start.FrameDirPath = strings.TrimRight(opts.Start.FrameDirPath, "/")
 
-	err = checkDependencies(opts)
+	err = checkDependencies(opts.Start)
 
 	if err != nil {
-		fmt.Println("Some dependencies are missing. Please install them before continuing:")
-		fmt.Println("")
-		fmt.Println(err.Error())
+		log.Println("Some dependencies are missing. Please install them before continuing:")
+		log.Println("")
+		log.Println(err.Error())
 		os.Exit(1)
 	}
 
-	os.MkdirAll(opts.FrameDirPath, 0700)
+	os.MkdirAll(opts.Start.FrameDirPath, 0700)
 
-	fmt.Printf("Input device: %s\n", opts.InputDevice)
-	fmt.Printf("Local frame dir: %s\n", opts.FrameDirPath)
-	if opts.RemoteDir != "" {
+	captureStartTime = time.Now()
+
+	log.Printf("Input device format: %s\n", opts.Start.InputDeviceFormat)
+	log.Printf("Input device: %s\n", opts.Start.InputDevice)
+	log.Printf("Local frame dir: %s\n", opts.Start.FrameDirPath)
+	log.Printf("Burst mode threshold: %.2f%%\n", opts.Start.BurstModeThreshold)
+
+	if opts.Start.RemoteDir != "" {
 		p := "Default"
-		if opts.RemotePort != "" { p = opts.RemotePort } 
-		fmt.Printf("Remote frame dir: %s Port: %s\n", opts.RemoteDir, p)
+		if opts.Start.RemotePort != "" { p = opts.Start.RemotePort } 
+		log.Printf("Remote frame dir: %s Port: %s\n", opts.Start.RemoteDir, p)
 	}
 
-	go captureWorker(opts)
-	go cleanUpLocalFilesWorker(opts)
+	go captureVideoWorker(opts.Start)
+	go captureWorker(opts.Start)
+	go cleanUpLocalFilesWorker(opts.Start)
 
-	if opts.BurstModeFormat == "video" {
-		go captureVideoWorker(opts)
-	}
-
-	if opts.RemoteDir != "" {
+	if opts.Start.RemoteDir != "" {
 		useRsync = commandIsAvailable("rsync")
-		go remoteCopyWorker(opts)
-		go cleanUpRemoteFilesWorker(opts)
+		go remoteCopyWorker(opts.Start)
+		go cleanUpRemoteFilesWorker(opts.Start)
 	}
 
 	<-captureWorkerDone
