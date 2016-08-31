@@ -8,6 +8,7 @@ package main
 // TODO: "init" to setup pmcctv with good settings
 // TODO: force pub key auth over SSH (since it's hard to automate anything otherwise)? -o PreferredAuthentications=pubkey -o PasswordAuthentication=no -o PubkeyAuthentication=yes
 // TODO: refactor burstModeEnabled, so that it's an event that any worker can respond to. Currently, only videoWorker respond to it, and, if not running, the channel update block the application.
+// TODO: better logging - error / trace
 
 // # Setup the server
 //
@@ -58,10 +59,16 @@ type StartCommandOptions struct {
 	RemotePort         string  `short:"p" long:"remote-port" description:"Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
 	BurstModeDuration  int     `          long:"burst-mode-duration" description:"Duration of burst mode, in seconds. Set to 0 to disable burst mode altogether." default:"30"`
 	BurstModeFormat    string  `          long:"burst-mode-format" description:"Format of burst mode captured files, either \"image\" or \"video\"." default:"video"`
-	BurstModeThreshold float32 `         long:"burst-mode-threshold" description:"How different two successive frames must be (as a percentage) for Burst Mode to be enabled." default:"1.0"`
+	BurstModeThreshold float32 `          long:"burst-mode-threshold" description:"How different two successive frames must be (as a percentage) for Burst Mode to be enabled." default:"1.0"`
 	FramesTtl          int     `          long:"time-to-live" description:"For how long captured frames should be kept, in days." default:"7"`
 	InputDeviceFormat  string  `short:"f" long:"input-device-format" description:"Format of capture input device. (default: auto-detect)"`
 	InputDevice        string  `short:"i" long:"input-device" description:"Name of capture input device. (default: auto-detect)"`
+	EmailFrom          string  `          long:"email-from" description:"Address from whom the email should be sent. To avoid being detected as spam, it's better to put your own, valid, email address."`
+	EmailTo            string  `          long:"email-to" description:"Address to whom the email should be sent."`
+	EmailSmtpDomain    string  `          long:"email-smtp-domain" description:"SMTP domain that should be used to send the email (eg. 'smtp.gmail.com')."`
+	EmailSmtpPort      int     `          long:"email-smtp-port" description:"SMTP port that should be used to send the email (eg. '587')."`
+	EmailSmtpPassword  string  `          long:"email-smtp-password" description:"Password to connect to the SMTP server."`
+	EmailLinkBaseUrl   string  `          long:"email-link-base-url" description:"Base URL where the PMCCTV server is located. (eg. 'https://example.com/pmcctv/index.php')."`
 }
 
 type AppCommandOptions struct {
@@ -97,27 +104,31 @@ func imageDimensions(imagePath string) (int, int, error) {
 	return image.Width, image.Height, nil
 }
 
-func sendEmail() {
+func sendEmail(opts StartCommandOptions) {
 	now := time.Now()
 
 	if now.Sub(captureStartTime) > time.Duration(60) * time.Second && (lastEmailTime.IsZero() || now.Sub(lastEmailTime) > time.Duration(20) * time.Second) {
 		log.Println("Sending email...")
 
-		msg := "From: " + from + "\n" +
-			"To: " + to + "\n" +
-			"Subject: Motion detected\n\n" +
-			body
+		body := opts.EmailLinkBaseUrl
 
-		err := smtp.SendMail("smtp.gmail.com:587",
-			smtp.PlainAuth("", from, pass, "smtp.gmail.com"),
-			from, []string{to}, []byte(msg))
+		msg := "From: " + opts.EmailFrom + "\n" +
+		       "To: " + opts.EmailTo + "\n" +
+		       "Subject: Motion detected\n\n" +
+		       body
 
-		if err != nil {
-			log.Println("smtp error: %s", err)
-			return
-		}
+		err := smtp.SendMail(
+			opts.EmailSmtpDomain + ":" + strconv.Itoa(opts.EmailSmtpPort),
+			smtp.PlainAuth("", opts.EmailFrom, opts.EmailSmtpPassword, opts.EmailSmtpDomain),
+			opts.EmailFrom, []string{opts.EmailTo}, []byte(msg),
+		)
 
 		lastEmailTime = now
+
+		if err != nil {
+			log.Println("Smtp error: %s", err)
+			return
+		}
 	}
 }
 
@@ -348,7 +359,7 @@ func captureVideoWorker(opts StartCommandOptions) {
 				break
 			}
 
-			log.Printf("Burst mode: capturing video for %d seconds...\n", opts.BurstModeDuration)
+			log.Printf("[BM] Capturing video for %d seconds...\n", opts.BurstModeDuration)
 			commandHasFinished = false
 			videoFileBasePath = opts.FrameDirPath + "/cap_" + time.Now().Format("20060102T150405") + "_"
 			// Need to record in flv format since it's more robust and
@@ -367,11 +378,24 @@ func captureVideoWorker(opts StartCommandOptions) {
 			}
 			
 			if cmd != nil {
-				cmd.Process.Kill()
+				// Kill it twice since TERM sometime fails
+				err = cmd.Process.Kill()
+				if err != nil {
+					log.Printf("Could not kill ffmpeg process (TERM signal - trying SIGKILL SIGNAL): %s\n", err)
+				}
+				time.Sleep(1 * time.Second) // Give it a chance to terminate properly
+				err = cmd.Process.Signal(os.Kill)
+				if err != nil {
+					// Don't display anything for "Access is denied" error because it means the previous TERM signal
+					// has already killed the process.
+					if strings.Index(err.Error(), "Access is denied") < 0 {
+						log.Printf("Could not kill ffmpeg process (SIGKILL signal): %s\n", err)
+					}
+				}
 				cmd = nil
 			}
 			commandHasFinished = true
-			log.Println("Burst mode: done capturing video.")
+			log.Println("[BM] Done capturing video.")
 
 		default:
 
@@ -422,7 +446,6 @@ func captureWorker(opts StartCommandOptions) {
 	for {
 		now := time.Now()
 
-
 		if burstMode && opts.BurstModeFormat == "video" {
 
 		} else {
@@ -453,10 +476,11 @@ func captureWorker(opts StartCommandOptions) {
 				}
 				percentDiff := (float32(diff) / float32(width * height)) * 100
 				if percentDiff < opts.BurstModeThreshold {
-					log.Printf(burstModeMarker+"Same as previous image: delete (Diff = %.2f)\n", percentDiff)
-					os.Remove(framePath)
+					log.Printf(burstModeMarker+"Same as previous image: delete (Diff = %.2f%%)\n", percentDiff)
+					os.Remove(previousFramePath)
+					previousFramePath = framePath
 				} else {
-					log.Printf(burstModeMarker+"Different image: keep (Diff = %.2f)\n", percentDiff)
+					log.Printf(burstModeMarker+"Different image: keep (Diff = %.2f%%)\n", percentDiff)
 					filesToUpload <- framePath
 					previousFramePath = framePath
 					lastMotionTime = now
@@ -479,7 +503,7 @@ func captureWorker(opts StartCommandOptions) {
 			burstMode = now.Sub(lastMotionTime) <= time.Duration(opts.BurstModeDuration)*time.Second
 			if burstMode != previousBurstMode {
 				if burstMode {
-					sendEmail()
+					sendEmail(opts)
 					burstModeEnabled <- true
 				} else {
 					burstModeDisabled <- true
