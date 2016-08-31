@@ -1,7 +1,7 @@
 package main
 
 // TODO: check shellPath logic - doesn't support DOS paths
-// Capture video files, split into x seconds parts: 
+// Capture video files, split into x seconds parts:
 // TODO: allow specifying the capture device
 // TODO: before running pmcctv, check that the specified video capture device exists and is working
 // TODO: auto detect device on Windows
@@ -13,39 +13,37 @@ package main
 // # Setup the server
 //
 // The server is optional but is convenient to view the captured videos and images.
-// 
+//
 // 1. Copy the file index.php to your server.
 // 2. Open the file index.php in a URL. For example, https://yourserver.com/path/to/index.php
 // 3. Since not configuration is currently defined, it will ask you to create one. To do so, follow the instructions on screen.
-// 4. Create the config.php file as instructed and upload it in the same directory as your server. 
+// 4. Create the config.php file as instructed and upload it in the same directory as your server.
 //
 // # Setup the command line client
-// 
+//
 // 1. Run `pmcctv init` to setup the various parameters, including selecting the correct webcam, specifying the remote location, etc.
 // 2. Run `pmcctv start` to start capturing frames.
 // 3. Run `pmcctv --help` for additional information
-
-
 
 import (
 	"bufio"
 	"errors"
 	"fmt"
+	"image"
+	"log"
+	"net/smtp"
 	"os"
 	"os/exec"
 	"os/user"
-	"path/filepath"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"log"
 	"time"
-	"image"
-	"net/smtp"
 
-    _ "image/jpeg"
-    _ "image/png"
+	_ "image/jpeg"
+	_ "image/png"
 
 	"github.com/jessevdk/go-flags"
 )
@@ -53,7 +51,7 @@ import (
 const VERSION = "1.0.0"
 
 type StartCommandOptions struct {
-	FfmpegPath        string   `          long:"ffmpeg" description:"Path to ffmpeg." default:"ffmpeg"`
+	FfmpegPath         string  `          long:"ffmpeg" description:"Path to ffmpeg." default:"ffmpeg"`
 	FrameDirPath       string  `short:"d" long:"frame-dir" description:"Path to directory that will contain the captured frames. (default: <PictureDirectory>/pmcctv)"`
 	RemoteDir          string  `short:"r" long:"remote-dir" description:"Remote location where frames will be saved to. Must contain a path compatible with scp (eg. user@someip:~/pmcctv)."`
 	RemotePort         string  `short:"p" long:"remote-port" description:"Port of remote location where frames will be saved to. If not set, whatever is the default scp port will be used (should be 22)."`
@@ -76,7 +74,7 @@ type AppCommandOptions struct {
 }
 
 type CommandOptions struct {
-	App AppCommandOptions
+	App   AppCommandOptions
 	Start StartCommandOptions
 }
 
@@ -107,18 +105,18 @@ func imageDimensions(imagePath string) (int, int, error) {
 func sendEmail(opts StartCommandOptions) {
 	now := time.Now()
 
-	if now.Sub(captureStartTime) > time.Duration(60) * time.Second && (lastEmailTime.IsZero() || now.Sub(lastEmailTime) > time.Duration(20) * time.Second) {
+	if now.Sub(captureStartTime) > time.Duration(60)*time.Second && (lastEmailTime.IsZero() || now.Sub(lastEmailTime) > time.Duration(20)*time.Second) {
 		log.Println("Sending email...")
 
 		body := opts.EmailLinkBaseUrl
 
 		msg := "From: " + opts.EmailFrom + "\n" +
-		       "To: " + opts.EmailTo + "\n" +
-		       "Subject: Motion detected\n\n" +
-		       body
+			"To: " + opts.EmailTo + "\n" +
+			"Subject: Motion detected\n\n" +
+			body
 
 		err := smtp.SendMail(
-			opts.EmailSmtpDomain + ":" + strconv.Itoa(opts.EmailSmtpPort),
+			opts.EmailSmtpDomain+":"+strconv.Itoa(opts.EmailSmtpPort),
 			smtp.PlainAuth("", opts.EmailFrom, opts.EmailSmtpPassword, opts.EmailSmtpDomain),
 			opts.EmailFrom, []string{opts.EmailTo}, []byte(msg),
 		)
@@ -132,7 +130,7 @@ func sendEmail(opts StartCommandOptions) {
 	}
 }
 
-func captureFrame(filePath string, opts StartCommandOptions) (error) {
+func captureFrame(filePath string, opts StartCommandOptions) error {
 	// Linux: ffmpeg -y -loglevel fatal -f video4linux2 -i /dev/video0 -r 1 -t 0.0001 $FILENAME
 	// OSX: $FFMPEG -loglevel fatal -f avfoundation -i "" -r 1 -t 0.0001 $FILENAME
 	// Windows: ffmpeg -y -loglevel fatal -f dshow -i video="USB2.0 HD UVC WebCam" -r 1 -t 0.0001 test.jpg
@@ -242,7 +240,7 @@ func compareFrames(path1 string, path2 string, diffPath string) (int, error) {
 	cmd := exec.Command("compare", args...)
 	buff, err := cmd.CombinedOutput()
 	// On Windows, `compare` appears to always return an error code, even when successful
-	// so the `parseInt` code after that will take care of checking if it's really an 
+	// so the `parseInt` code after that will take care of checking if it's really an
 	// error or if it worked.
 	if err != nil && runtime.GOOS != "windows" {
 		return 0, errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
@@ -284,28 +282,28 @@ func multipleRemoteCopy(paths []string, opts StartCommandOptions) error {
 
 	// It only makes sense to use rsync if there's more than one file to transfer
 	// if useRsync && len(paths) > 1 {
-		// rsync -a <paths> <remote_dir>
+	// rsync -a <paths> <remote_dir>
 
-		args = append(args, "-a")
-		args = append(args, "--chmod=D700,F666")
+	args = append(args, "-a")
+	args = append(args, "--chmod=D700,F666")
 
-		for _, path := range paths {
-			args = append(args, shellPath(path))
-		}
+	for _, path := range paths {
+		args = append(args, shellPath(path))
+	}
 
-		if opts.RemotePort != "" {
-			args = append(args, "-e")
-			args = append(args, "ssh -p " + opts.RemotePort)
-		}
+	if opts.RemotePort != "" {
+		args = append(args, "-e")
+		args = append(args, "ssh -p "+opts.RemotePort)
+	}
 
-		args = append(args, opts.RemoteDir)
+	args = append(args, opts.RemoteDir)
 
-		cmd := exec.Command("rsync", args...)
-		buff, err := cmd.CombinedOutput()
+	cmd := exec.Command("rsync", args...)
+	buff, err := cmd.CombinedOutput()
 
-		if err != nil {
-			return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
-		}
+	if err != nil {
+		return errors.New(fmt.Sprintf("%s: %s", err, string(buff)))
+	}
 	// } else {
 	// 	// 	scp <path> <remote_dir>
 
@@ -327,12 +325,12 @@ func multipleRemoteCopy(paths []string, opts StartCommandOptions) error {
 	// 	}
 
 	// }
-	
+
 	return nil
 }
 
 func fileSize(filePath string) (int64, error) {
-	file, err := os.Open(filePath) 
+	file, err := os.Open(filePath)
 	if err != nil {
 		return 0, err
 	}
@@ -376,7 +374,7 @@ func captureVideoWorker(opts StartCommandOptions) {
 			if opts.BurstModeFormat != "video" {
 				break
 			}
-			
+
 			if cmd != nil {
 				// Kill it twice since TERM sometime fails
 				err = cmd.Process.Kill()
@@ -409,7 +407,7 @@ func captureVideoWorker(opts StartCommandOptions) {
 				filePaths, err := filepath.Glob(videoFileBasePath + "*.webm")
 				if err != nil {
 					log.Printf("Cannot retrieve video file paths: %s\n", err)
-					continue;
+					continue
 				}
 
 				for _, filePath := range filePaths {
@@ -434,7 +432,7 @@ func captureVideoWorker(opts StartCommandOptions) {
 
 				time.Sleep(500 * time.Millisecond)
 			}
-			}
+		}
 	}
 }
 
@@ -474,7 +472,7 @@ func captureWorker(opts StartCommandOptions) {
 				if burstMode {
 					burstModeMarker = "[BM] "
 				}
-				percentDiff := (float32(diff) / float32(width * height)) * 100
+				percentDiff := (float32(diff) / float32(width*height)) * 100
 				if percentDiff < opts.BurstModeThreshold {
 					log.Printf(burstModeMarker+"Same as previous image: delete (Diff = %.2f%%)\n", percentDiff)
 					os.Remove(previousFramePath)
@@ -629,7 +627,7 @@ var isCygwin_ = false
 
 func isCygwin() bool {
 	if cygwinCheckDone_ {
-		return isCygwin_;
+		return isCygwin_
 	}
 	cygwinCheckDone_ = true
 	r, err := exec.Command("uname", "-o").CombinedOutput()
@@ -645,11 +643,11 @@ func shellPath(path string) string {
 	if isCygwin() {
 		r, err := exec.Command("cygpath", "-u", path).CombinedOutput()
 		if err != nil {
-			log.Println("Error: cannot convert Cygwin path: %s", path) 
+			log.Println("Error: cannot convert Cygwin path: %s", path)
 		}
 		return strings.Trim(string(r), "\r\n\t ")
 	}
-	
+
 	return filepath.ToSlash(path)
 }
 
@@ -668,13 +666,13 @@ func checkDependencies(opts StartCommandOptions) error {
 		return errors.New(strings.Join(s, "\n"))
 	} else {
 		return nil
-	}	
+	}
 }
 
 func printHelp(flagParser *flags.Parser) {
 	flagParser.WriteHelp(os.Stdout)
 	log.Printf("\n")
-	log.Printf("For help with a particular command, type \"%s <command> --help\"\n", path.Base(os.Args[0]))	
+	log.Printf("For help with a particular command, type \"%s <command> --help\"\n", path.Base(os.Args[0]))
 }
 
 func initCommand() {
@@ -699,7 +697,7 @@ func initCommand() {
 	os.Exit(0)
 }
 
-func createFlagParser(opts *CommandOptions) (*flags.Parser) {
+func createFlagParser(opts *CommandOptions) *flags.Parser {
 	flagParser := flags.NewParser(&opts.App, flags.HelpFlag|flags.PassDoubleDash)
 
 	flagParser.AddCommand(
@@ -728,7 +726,6 @@ func main() {
 	// buff, err := cmd.CombinedOutput()
 	// log.Println(err)
 	// log.Println(string(buff))
-
 
 	// os.Exit(0)
 
@@ -809,7 +806,9 @@ func main() {
 
 	if opts.Start.RemoteDir != "" {
 		p := "Default"
-		if opts.Start.RemotePort != "" { p = opts.Start.RemotePort } 
+		if opts.Start.RemotePort != "" {
+			p = opts.Start.RemotePort
+		}
 		log.Printf("Remote frame dir: %s Port: %s\n", opts.Start.RemoteDir, p)
 	}
 
