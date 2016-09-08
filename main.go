@@ -1,7 +1,6 @@
 package main
 
 // TODO: check shellPath logic - doesn't support DOS paths
-// Capture video files, split into x seconds parts:
 // TODO: allow specifying the capture device
 // TODO: before running pmcctv, check that the specified video capture device exists and is working
 // TODO: auto detect device on Windows
@@ -32,6 +31,7 @@ import (
 	"image"
 	"log"
 	"net/smtp"
+	"net/mail"
 	"os"
 	"os/exec"
 	"os/user"
@@ -46,6 +46,7 @@ import (
 	_ "image/png"
 
 	"github.com/jessevdk/go-flags"
+	"github.com/scorredoira/email"
 )
 
 const VERSION = "1.0.0"
@@ -61,6 +62,7 @@ type StartCommandOptions struct {
 	FramesTtl          int     `          long:"time-to-live" description:"For how long captured frames should be kept, in days." default:"7"`
 	InputDeviceFormat  string  `short:"f" long:"input-device-format" description:"Format of capture input device. (default: auto-detect)"`
 	InputDevice        string  `short:"i" long:"input-device" description:"Name of capture input device. (default: auto-detect)"`
+
 	EmailFrom          string  `          long:"email-from" description:"Address from whom the email should be sent. To avoid being detected as spam, it's better to put your own, valid, email address."`
 	EmailTo            string  `          long:"email-to" description:"Address to whom the email should be sent."`
 	EmailSmtpDomain    string  `          long:"email-smtp-domain" description:"SMTP domain that should be used to send the email (eg. 'smtp.gmail.com')."`
@@ -102,30 +104,31 @@ func imageDimensions(imagePath string) (int, int, error) {
 	return image.Width, image.Height, nil
 }
 
-func sendEmail(opts StartCommandOptions) {
+func sendEmail(opts StartCommandOptions, percentDiff float32, previousFramePath string, framePath string) {
 	now := time.Now()
+	var err error
 
 	if now.Sub(captureStartTime) > time.Duration(60)*time.Second && (lastEmailTime.IsZero() || now.Sub(lastEmailTime) > time.Duration(20)*time.Second) {
 		log.Println("Sending email...")
 
+		subject := fmt.Sprintf("Motion detected [Diff: %.2f%%]", percentDiff)
 		body := opts.EmailLinkBaseUrl
+    
+		m := email.NewMessage(subject, body)
+		m.From = mail.Address{Name: "", Address: opts.EmailFrom}
+		m.To = []string{opts.EmailTo}
 
-		msg := "From: " + opts.EmailFrom + "\n" +
-			"To: " + opts.EmailTo + "\n" +
-			"Subject: Motion detected\n\n" +
-			body
+		if err = m.Attach(previousFramePath); err != nil {
+			log.Println("Email attachment error for %s: %s", previousFramePath, err)
+		}
 
-		err := smtp.SendMail(
-			opts.EmailSmtpDomain+":"+strconv.Itoa(opts.EmailSmtpPort),
-			smtp.PlainAuth("", opts.EmailFrom, opts.EmailSmtpPassword, opts.EmailSmtpDomain),
-			opts.EmailFrom, []string{opts.EmailTo}, []byte(msg),
-		)
+		if err = m.Attach(framePath); err != nil {
+			log.Println("Email attachment error for %s: %s", framePath, err)
+		}
 
-		lastEmailTime = now
-
-		if err != nil {
-			log.Println("Smtp error: %s", err)
-			return
+		auth := smtp.PlainAuth("", opts.EmailFrom, opts.EmailSmtpPassword, opts.EmailSmtpDomain)
+		if err = email.Send(opts.EmailSmtpDomain+":"+strconv.Itoa(opts.EmailSmtpPort), auth, m); err != nil {
+			log.Println(err)
 		}
 	}
 }
@@ -479,6 +482,7 @@ func captureWorker(opts StartCommandOptions) {
 					previousFramePath = framePath
 				} else {
 					log.Printf(burstModeMarker+"Different image: keep (Diff = %.2f%%)\n", percentDiff)
+					sendEmail(opts, percentDiff, previousFramePath, framePath)
 					filesToUpload <- framePath
 					previousFramePath = framePath
 					lastMotionTime = now
@@ -501,7 +505,6 @@ func captureWorker(opts StartCommandOptions) {
 			burstMode = now.Sub(lastMotionTime) <= time.Duration(opts.BurstModeDuration)*time.Second
 			if burstMode != previousBurstMode {
 				if burstMode {
-					sendEmail(opts)
 					burstModeEnabled <- true
 				} else {
 					burstModeDisabled <- true
@@ -709,6 +712,20 @@ func createFlagParser(opts *CommandOptions) *flags.Parser {
 
 	return flagParser
 }
+
+// func ffmpegDevices() {
+// 	args = []string{
+// 		"-hide_banner",
+// 		"-list_devices",
+// 		"true",
+// 		"-f", "dshow",
+// 		"-i", "dummy",
+// 	}
+// 	cmd := exec.Command("ffmpeg", args...)
+// 	buff, err := cmd.CombinedOutput()
+
+
+// }
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())

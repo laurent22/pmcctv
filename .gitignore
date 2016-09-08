@@ -5,3 +5,6 @@ pmcctv.exe
 run.sh
 *.sublime-project
 *.sublime-workspace
+config.php
+deploy_server.sh
+pmcctv.sh
